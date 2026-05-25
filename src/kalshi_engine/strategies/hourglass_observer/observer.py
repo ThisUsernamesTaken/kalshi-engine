@@ -1,0 +1,186 @@
+"""Hourglass 1hr observer strategy.
+
+Subscribes to KX{C}D 1hr digital markets and emits `book_at_1hr_pretrigger`
+envelopes at configurable τ minutes into each cycle. Pure observation: no
+decisions, no orders, no risk-envelope interaction.
+
+Envelope schema (per emit):
+    {
+      kind:                      "book_at_1hr_pretrigger",
+      ticker:                    str,
+      ts_ms:                     int,         # book.recv_ms
+      cycle_open_ms:             int,
+      cycle_close_ms:             int,
+      elapsed_min:               float,       # since cycle_open
+      tau_min:                   float,       # to cycle_close
+      window_label:              str,         # one of {"T+30","T+40","T+45","T+50","T+55"}
+      yes_bid: yes_ask: no_bid: no_ask:  int (decicents)
+      spot:                      float | None
+      vol_30m:                   float | None
+      bb_div:                    float | None  # constant-vol BB, best-effort
+      bps_margin:                float | None
+      favorite_side:             "yes" | "no"
+      favorite_mid_decicents:    float
+    }
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from math import log
+from statistics import NormalDist
+
+from kalshi_engine.core.events import BookEvent, LifecycleEvent, SettlementEvent, SpotEvent
+from kalshi_engine.risk.envelope import crypto_of_ticker
+from kalshi_engine.strategies.favorite_chase.state import FavoriteChaseState
+
+_NORM = NormalDist()
+
+
+@dataclass(frozen=True)
+class HourMarketMeta:
+    ticker: str
+    strike: float
+    open_ms: int
+    close_ms: int
+
+
+class HourglassObserverStrategy:
+    """1hr observer — pure observability, no orders.
+
+    Sampling windows (default): T+30, T+40, T+45, T+50, T+55 minutes into the
+    cycle. The first book event whose elapsed-minutes lands within ±15s of
+    each target triggers a single envelope per window per ticker.
+    """
+
+    # Half-width of each sampling window around the target minute (seconds).
+    # E.g., T+30 is sampled by the first book at elapsed >= 30:00 and
+    # < 30:30 that hasn't been sampled yet.
+    _WINDOW_HALF_S = 30
+
+    def __init__(
+        self,
+        log_writer,
+        observe_minutes: tuple[int, ...] = (30, 40, 45, 50, 55),
+    ) -> None:
+        if log_writer is None:
+            raise ValueError("HourglassObserverStrategy requires a log_writer")
+        self._log = log_writer
+        self.observe_minutes = tuple(observe_minutes)
+        self.markets: dict[str, HourMarketMeta] = {}
+        # Per-crypto rolling state (for spot/vol/bb_div diagnostics).
+        self._states: dict[str, FavoriteChaseState] = {}
+        # Per-ticker per-window: True iff already emitted for that window
+        # in this cycle. Cleared on settlement.
+        self._sampled: dict[str, set[int]] = {}
+
+    # -- registration ---------------------------------------------------------
+    def register_market(self, ticker: str, strike: float,
+                         open_ms: int, close_ms: int) -> None:
+        self.markets[ticker] = HourMarketMeta(
+            ticker, float(strike), int(open_ms), int(close_ms),
+        )
+        self._sampled.setdefault(ticker, set())
+
+    def _state(self, crypto: str) -> FavoriteChaseState:
+        if crypto not in self._states:
+            self._states[crypto] = FavoriteChaseState(crypto)
+        return self._states[crypto]
+
+    # -- event routing --------------------------------------------------------
+    def on_event(self, event, model=None):
+        """Route one event. Always returns None — never emits Decisions."""
+        if isinstance(event, SpotEvent):
+            self._state(event.crypto.value).update_spot(event)
+            return None
+        if isinstance(event, BookEvent):
+            self._on_book(event)
+            return None
+        if isinstance(event, LifecycleEvent):
+            # Lifecycle metadata can register a market if discovery missed it.
+            if event.strike and event.open_ms and event.close_ms:
+                self.register_market(
+                    event.ticker, event.strike, event.open_ms, event.close_ms,
+                )
+            return None
+        if isinstance(event, SettlementEvent):
+            # Clear sampling state for this cycle so the next cycle of the
+            # same series starts fresh (tickers are per-cycle so this is
+            # belt-and-suspenders).
+            self._sampled.pop(event.ticker, None)
+            return None
+        return None
+
+    # -- the actual observation logic ----------------------------------------
+    def _on_book(self, book: BookEvent) -> None:
+        meta = self.markets.get(book.ticker)
+        if meta is None:
+            return  # unregistered market — no cycle timing available
+        elapsed_ms = book.recv_ms - meta.open_ms
+        elapsed_min = elapsed_ms / 60_000.0
+        # Identify which sampling window this book lands in (if any).
+        window_min = None
+        for m in self.observe_minutes:
+            # Window: [m, m + 0.5)  i.e. first 30 seconds of minute m
+            if m <= elapsed_min < m + (self._WINDOW_HALF_S / 60.0):
+                window_min = m
+                break
+        if window_min is None:
+            return
+        sampled = self._sampled.setdefault(book.ticker, set())
+        if window_min in sampled:
+            return  # already emitted for this window in this cycle
+        sampled.add(window_min)
+        self._emit_envelope(book, meta, window_min, elapsed_min)
+
+    def _emit_envelope(
+        self, book: BookEvent, meta: HourMarketMeta,
+        window_min: int, elapsed_min: float,
+    ) -> None:
+        crypto = crypto_of_ticker(book.ticker)
+        state = self._state(crypto)
+        spot = state.latest_spot()
+        vol = state.vol_30m()
+        # Favorite by mid (NOT the 75c rule — we want observability even
+        # before a side hits 75c).
+        yes_mid = (book.yes_bid + book.yes_ask) / 2.0
+        no_mid = (book.no_bid + book.no_ask) / 2.0
+        if yes_mid >= no_mid:
+            fav_side, fav_mid = "yes", yes_mid
+        else:
+            fav_side, fav_mid = "no", no_mid
+        # bb_div: constant-vol Brownian bridge (best-effort; None if no spot/vol).
+        bb_div = None
+        bps_margin = None
+        if spot is not None and vol is not None and meta.strike > 0:
+            sigma = vol / 1e4
+            tau = (meta.close_ms - book.recv_ms) / 60_000.0
+            if sigma > 0 and tau > 0:
+                try:
+                    bb_yes = _NORM.cdf(
+                        log(spot / meta.strike) / (sigma * (tau ** 0.5))
+                    )
+                    bb_fav = bb_yes if fav_side == "yes" else 1.0 - bb_yes
+                    bb_div = float(fav_mid) / 1000.0 - bb_fav
+                except (ValueError, ZeroDivisionError):
+                    pass
+            bps_margin = abs(spot - meta.strike) / meta.strike * 1e4
+        self._log.write({
+            "kind": "book_at_1hr_pretrigger",
+            "ticker": book.ticker,
+            "ts_ms": book.recv_ms,
+            "cycle_open_ms": meta.open_ms,
+            "cycle_close_ms": meta.close_ms,
+            "elapsed_min": elapsed_min,
+            "tau_min": (meta.close_ms - book.recv_ms) / 60_000.0,
+            "window_label": f"T+{window_min}",
+            "yes_bid": book.yes_bid, "yes_ask": book.yes_ask,
+            "no_bid": book.no_bid, "no_ask": book.no_ask,
+            "spot": spot,
+            "vol_30m": vol,
+            "bb_div": bb_div,
+            "bps_margin": bps_margin,
+            "favorite_side": fav_side,
+            "favorite_mid_decicents": fav_mid,
+            "strike": meta.strike,
+        })

@@ -1,0 +1,380 @@
+"""Phase-4 cutpoints model - the favorite-chase decision policy.
+
+Applies the volatility / model-divergence / strike-margin cutpoints from the
+Phase 4 expansion analysis to turn a favorite-chase trigger into a sized
+Decision. Cutpoints load from a versioned warehouse artifact.
+
+This model is a decision *policy*, not a continuous fair-value model. It
+nominally satisfies the ``Model`` protocol (``update`` / ``fair_yes``) but its
+real entry point is ``evaluate()``. ``evaluate`` is given strike / now_ms /
+close_ms in addition to the protocol-implied args, because the Brownian-bridge
+fair (computed via FavoriteChaseState.bb_fair) genuinely needs strike and the
+time-to-close - the events themselves do not carry the strike.
+
+**Phase 12 alignment mode (Phase 12.1 / 12.2):** the sizing logic
+switches from the original UPSIZE_2X / ENTER_1X policy to an
+alignment-count tiered scheme derived from 24h of live data analysis. The
+3 strong-favor signals are:
+    s_vol = (vol_30m_pct < ALIGN_VOL_THRESHOLD)
+    s_div = (bb_div     < ALIGN_DIV_THRESHOLD)
+    s_bps = (bps_margin > ALIGN_BPS_MULT * crypto_threshold)
+align = s_vol + s_div + s_bps   # 0..3
+
+``align_mode="2tier"`` (Phase 12.1, conservative):
+    align <= 1 -> SKIP
+    align == 2 -> ENTER 1ct
+    align == 3 -> ENTER 2ct
+
+``align_mode="3tier"`` (Phase 12.2, full scheme):
+    align == 0 -> SKIP
+    align == 1 -> ENTER 1ct
+    align == 2 -> ENTER 2ct
+    align == 3 -> ENTER 3ct
+
+``align_mode="5tier"`` (Phase 12.4, validated conviction scheme — Scheme B):
+    Hard-gate skip on s_bps=0 or bb_div<=-0.20 (smile artifact) or bb_div>+0.09
+    or vol_pct>0.67. Otherwise sizing follows the weighted score:
+        score = 2*bb_div_band + 1*s_vol + 1.5*side_yes + 2*bps_strong
+        size  = round(score) clipped to [1, 5]
+    where:
+        bb_div_band = 1 iff -0.20 < bb_div <= 0   (empirical sweet spot)
+        bps_strong  = 1 iff bps_margin > 2*threshold (max-conviction marker)
+    Validated on 156 live + 218 Phase-4 trades: +$18.98 / +$20.27 vs +$2.26 /
+    -$12.66 baseline. The 5ct top tier was 31/31 wins on live and 25/26 on
+    Phase 4 (96.2% WR).
+
+``align_mode="disabled"`` reverts to the prior UPSIZE_2X / ENTER_1X policy
+for safety/reversibility.
+
+Skip-veto gates (vol_pct > skip threshold, bb_div > skip threshold,
+bps_margin < threshold, bb_div <= deep-tail threshold) remain in effect
+across all modes.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timezone
+from pathlib import Path
+
+from kalshi_engine.config import MODELS_DIR
+from kalshi_engine.core.interfaces import Decision
+from kalshi_engine.core.types import Action, Side
+from kalshi_engine.strategies.favorite_chase.rules import compute_strike_distance_bps
+from kalshi_engine.strategies.favorite_chase.state import FavoriteChaseState
+
+_DEFAULT_CUTPOINTS = MODELS_DIR / "phase4_cutpoints" / "v3" / "cutpoints.json"
+
+# Phase 12.5: time-of-day SKIP window (UTC hours). Validated on LIVE n=21
+# (71.4% WR, -$2.68) + Phase4 n=100 (69.0% WR, -$11.63) — combined -$14.31.
+# US-AM regime (14-17Z = 10-13 ET = pre-NYSE-open through morning open).
+TOD_SKIP_HOURS = frozenset([14, 15, 16, 17])
+
+# Phase 12.1 strong-favor zone thresholds (per the alignment research).
+# Stricter than the existing UPSIZE_2X (-0.03) and SKIP (0.67) gates so they
+# differentiate the "strong-favor" zone from the merely-passing zone.
+ALIGN_VOL_THRESHOLD = 0.50
+ALIGN_DIV_THRESHOLD = -0.05
+ALIGN_BPS_MULT = 1.5
+
+# Phase 12.4 (Scheme B) — empirically-validated conviction thresholds.
+# bb_div lower bound: the deep-negative tail (<= -0.20) inverts (smile
+# artifact, 14 losses spread across 18 h validated multi-crypto/multi-side).
+# bb_div sweet-spot upper bound: (-0.20, 0] wins 96%+; (-0.05) cutoff used
+# previously was too permissive.
+DEEP_DIV_SKIP = -0.20
+DIV_BAND_UPPER = 0.0
+BPS_STRONG_MULT = 2.0   # bps_strong = bps_margin > 2 * crypto_threshold
+SIZE_CAP_5TIER = 5
+
+# Phase 12.6 (V13b) — validated optimization of the 5tier score formula.
+# Backtested on combined LIVE n=210 + Phase 4 n=218 = 428 trades.
+# Two changes vs V12:
+#   (a) side weighting FLIPPED from +1.5*side_yes to +1.5*side_no
+#       NO trades outperform YES after the hard gate filters out the
+#       smile/high-vol/low-bps cohort. 28/28 NO trades perfect; YES side
+#       hosted all 1-2 losses in the polling-disabled cohort.
+#   (b) s_vol weight DROPPED. Univariate analysis showed it as essentially
+#       noise (-0.3pp WR lift); removing it tightens the entry set
+#       without sacrificing PnL. 100% WR achieved on 71 LIVE trades.
+#   (c) super-band BONUS (+1) when bb_div in (-0.14, -0.09]. Concentrated
+#       sweet-spot of bb_div, validated as the strongest WR sub-band.
+# Bootstrap CI 99.7% V13b > V12.
+SUPER_BAND_LOW = -0.14
+SUPER_BAND_HIGH = -0.09
+
+ALIGN_MODES = ("disabled", "2tier", "3tier", "5tier", "5tier_v13b")
+
+
+class Phase4CutpointsModel:
+    """Favorite-chase decision policy driven by the Phase 4 cutpoints artifact."""
+
+    def __init__(
+        self,
+        cutpoints_path: str | None = None,
+        align_mode: str = "disabled",
+        time_of_day_skip: bool = True,
+    ) -> None:
+        path = Path(cutpoints_path) if cutpoints_path else _DEFAULT_CUTPOINTS
+        self.cutpoints_path = path
+        self.cutpoints = json.loads(path.read_text(encoding="utf-8"))
+        self.vol_skip_above = self.cutpoints["vol_30m_percentile_skip_above"]
+        self.vol_upsize_below = self.cutpoints["vol_30m_percentile_upsize_below"]
+        self.bb_div_skip_above = self.cutpoints["bb_div_skip_above"]
+        self.bb_div_upsize_below = self.cutpoints["bb_div_upsize_below"]
+        self.bps_thresholds = self.cutpoints["bps_thresholds"]
+        if align_mode not in ALIGN_MODES:
+            raise ValueError(
+                f"align_mode must be one of {ALIGN_MODES}, got {align_mode!r}"
+            )
+        self.align_mode = align_mode
+        self.time_of_day_skip = bool(time_of_day_skip)
+
+    # -- Model protocol (state lives in FavoriteChaseState, not the model) ----
+    def update(self, event) -> None:
+        """No-op: per-crypto state is held by FavoriteChaseState."""
+
+    def fair_yes(self, ticker: str, now_ms: int) -> float | None:
+        """Not provided - this is a cutpoint policy, not a fair-value model.
+        The Brownian-bridge fair is computed inside ``evaluate()``."""
+        return None
+
+    # -- the real entry point ------------------------------------------------
+    def evaluate(
+        self,
+        state: FavoriteChaseState,
+        ticker: str,
+        side: Side,
+        favorite_mid_decicents: float,
+        strike: float,
+        now_ms: int,
+        close_ms: int,
+    ) -> Decision:
+        """Apply the Phase 4 cutpoints to a favorite-chase trigger -> Decision."""
+        spot = state.latest_spot()
+        vol = state.vol_30m()
+        utc_hour = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).hour
+        diag: dict = {
+            "ticker": ticker,
+            "side": side.value,
+            "favorite_mid_decicents": favorite_mid_decicents,
+            "strike": strike,
+            "spot": spot,
+            "vol_30m": vol,
+            "utc_hour": utc_hour,
+            "time_of_day_skip_enabled": self.time_of_day_skip,
+        }
+        # Phase 12.5 — Rec 2: time-of-day SKIP gate (US-AM weak window).
+        # Validated: combined LIVE+P4 dropped n=100 at 69% WR / -$14.31 cumulative.
+        if self.time_of_day_skip and utc_hour in TOD_SKIP_HOURS:
+            diag["time_of_day_skip"] = True
+            return self._skip(
+                ticker, side,
+                f"time-of-day {utc_hour:02d}Z in {sorted(TOD_SKIP_HOURS)} window",
+                diag)
+        diag["time_of_day_skip"] = False
+        if spot is None or vol is None:
+            return self._skip(ticker, side, "no spot / vol history yet", diag)
+
+        vol_pct = state.vol_30m_percentile(vol)
+        sigma = vol / 1e4                       # bps/min -> per-minute fraction
+        tau = (close_ms - now_ms) / 60_000.0    # minutes to close
+        bb_yes = state.bb_fair(spot, strike, sigma, tau)
+        bb_fav = bb_yes if side is Side.YES else 1.0 - bb_yes
+        bb_div = state.bb_div(favorite_mid_decicents, bb_fav)
+        bps_margin = abs(compute_strike_distance_bps(spot, strike))
+        threshold = float(self.bps_thresholds.get(state.crypto, 0.0))
+
+        # Phase-12.1 strong-favor zone flags (always recorded for analysis,
+        # only used for sizing when align_mode != "disabled").
+        s_vol = 1 if vol_pct < ALIGN_VOL_THRESHOLD else 0
+        s_div = 1 if bb_div < ALIGN_DIV_THRESHOLD else 0
+        s_bps = 1 if bps_margin > ALIGN_BPS_MULT * threshold else 0
+        alignment_count = s_vol + s_div + s_bps
+
+        diag.update({
+            "vol_30m_pct": vol_pct,
+            "sigma_per_min": sigma,
+            "tau_min": tau,
+            "bb_yes": bb_yes,
+            "bb_fav_fair": bb_fav,
+            "bb_div": bb_div,
+            "bps_margin": bps_margin,
+            "bps_threshold": threshold,
+            "s_vol": s_vol,
+            "s_div": s_div,
+            "s_bps": s_bps,
+            "alignment_count": alignment_count,
+            "align_mode": self.align_mode,
+        })
+
+        # ---- cutpoints: skip gates (hardest veto first; all modes) ----
+        if vol_pct > self.vol_skip_above:
+            return self._skip(
+                ticker, side,
+                f"vol_pct {vol_pct:.2f} > {self.vol_skip_above}", diag)
+        if bb_div > self.bb_div_skip_above:
+            return self._skip(
+                ticker, side,
+                f"bb_div {bb_div:+.3f} > {self.bb_div_skip_above}", diag)
+        # Phase 12.4: deep-negative bb_div is a smile-artifact zone where
+        # the constant-vol BB overstates "cheap favorite" and the market
+        # is correctly pricing additional risk. Validated multi-crypto/
+        # multi-side on 14 live losses. Applies to ALL align_modes.
+        if bb_div <= DEEP_DIV_SKIP:
+            return self._skip(
+                ticker, side,
+                f"bb_div {bb_div:+.3f} <= {DEEP_DIV_SKIP} (smile zone)", diag)
+        if bps_margin < threshold:
+            return self._skip(
+                ticker, side,
+                f"bps_margin {bps_margin:.2f} < threshold {threshold:.2f}", diag)
+
+        # ---- sizing: depends on align_mode ----
+        if self.align_mode == "2tier":
+            # Phase 12.1 (conservative): align<=1 skip, =2 1ct, =3 2ct.
+            if alignment_count <= 1:
+                return self._skip(
+                    ticker, side,
+                    f"ALIGN_TIERED_2T skip: alignment {alignment_count} "
+                    f"(s_vol={s_vol} s_div={s_div} s_bps={s_bps})",
+                    diag)
+            if alignment_count == 2:
+                return Decision(
+                    ticker=ticker, action=Action.ENTER, side=side, size=1,
+                    confidence=0.7,
+                    reason=(f"ALIGN_TIERED_2T 2/3: s_vol={s_vol} s_div={s_div} "
+                            f"s_bps={s_bps} -> 1ct"),
+                    diagnostics=diag)
+            # alignment_count == 3
+            return Decision(
+                ticker=ticker, action=Action.ENTER, side=side, size=2,
+                confidence=0.9,
+                reason=(f"ALIGN_TIERED_2T 3/3: s_vol={s_vol} s_div={s_div} "
+                        f"s_bps={s_bps} -> 2ct"),
+                diagnostics=diag)
+
+        if self.align_mode == "3tier":
+            # Phase 12.2 (full scheme): =0 skip, =1 1ct, =2 2ct, =3 3ct.
+            if alignment_count == 0:
+                return self._skip(
+                    ticker, side,
+                    f"ALIGN_TIERED_3T skip: alignment 0 "
+                    f"(s_vol={s_vol} s_div={s_div} s_bps={s_bps})",
+                    diag)
+            if alignment_count == 1:
+                return Decision(
+                    ticker=ticker, action=Action.ENTER, side=side, size=1,
+                    confidence=0.5,
+                    reason=(f"ALIGN_TIERED_3T 1/3: s_vol={s_vol} s_div={s_div} "
+                            f"s_bps={s_bps} -> 1ct"),
+                    diagnostics=diag)
+            if alignment_count == 2:
+                return Decision(
+                    ticker=ticker, action=Action.ENTER, side=side, size=2,
+                    confidence=0.7,
+                    reason=(f"ALIGN_TIERED_3T 2/3: s_vol={s_vol} s_div={s_div} "
+                            f"s_bps={s_bps} -> 2ct"),
+                    diagnostics=diag)
+            # alignment_count == 3
+            return Decision(
+                ticker=ticker, action=Action.ENTER, side=side, size=3,
+                confidence=0.9,
+                reason=(f"ALIGN_TIERED_3T 3/3: s_vol={s_vol} s_div={s_div} "
+                        f"s_bps={s_bps} -> 3ct"),
+                diagnostics=diag)
+
+        if self.align_mode == "5tier":
+            # Phase 12.4 — validated conviction scheme (Scheme B).
+            # s_bps is the OOS-robust hard gate; the deep-div SKIP above
+            # protects the smile-artifact zone. By the time we get here:
+            #   s_bps == 1  (else SKIP above on bps_margin < threshold ...
+            #     actually 1.5x check below) -- recompute as hard gate:
+            if s_bps == 0:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER skip: s_bps=0 (bps_margin {bps_margin:.2f} <= "
+                    f"{ALIGN_BPS_MULT}*{threshold:.2f})", diag)
+            bb_div_band = 1 if (DEEP_DIV_SKIP < bb_div <= DIV_BAND_UPPER) else 0
+            side_yes = 1 if side is Side.YES else 0
+            bps_strong = 1 if bps_margin > BPS_STRONG_MULT * threshold else 0
+            score = (2.0 * bb_div_band + 1.0 * s_vol
+                     + 1.5 * side_yes + 2.0 * bps_strong)
+            size = max(1, min(SIZE_CAP_5TIER, int(round(score)))) if score > 0 else 1
+            diag.update({
+                "bb_div_band": bb_div_band,
+                "bps_strong": bps_strong,
+                "side_yes": side_yes,
+                "score_5tier": score,
+            })
+            # Confidence proxy = score / max_possible_score (6.5).
+            conf = min(1.0, score / 6.5)
+            return Decision(
+                ticker=ticker, action=Action.ENTER, side=side, size=size,
+                confidence=conf,
+                reason=(f"5TIER score={score:.1f} -> {size}ct "
+                        f"(bps_strong={bps_strong} div_band={bb_div_band} "
+                        f"vol={s_vol} yes={side_yes})"),
+                diagnostics=diag)
+
+        if self.align_mode == "5tier_v13b":
+            # Phase 12.6 — V13b score formula. Changes vs 5tier:
+            #   - side_yes(+1.5) -> side_no(+1.5)   [side flip]
+            #   - s_vol weight dropped              [noise removal]
+            #   - super_band(+1) bonus on bb_div in (SUPER_BAND_LOW, SUPER_BAND_HIGH]
+            # See SUPER_BAND_* / V13b doc-comments at top of module.
+            if s_bps == 0:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B skip: s_bps=0 (bps_margin {bps_margin:.2f} <= "
+                    f"{ALIGN_BPS_MULT}*{threshold:.2f})", diag)
+            bb_div_band = 1 if (DEEP_DIV_SKIP < bb_div <= DIV_BAND_UPPER) else 0
+            side_no = 1 if side is Side.NO else 0
+            side_yes = 1 - side_no
+            bps_strong = 1 if bps_margin > BPS_STRONG_MULT * threshold else 0
+            super_band = 1 if (SUPER_BAND_LOW < bb_div <= SUPER_BAND_HIGH) else 0
+            score = (2.0 * bb_div_band + 1.5 * side_no
+                     + 2.0 * bps_strong + 1.0 * super_band)
+            if score <= 0:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B skip: score=0 "
+                    f"(div_band={bb_div_band} side_no={side_no} "
+                    f"bps_strong={bps_strong} super_band={super_band})", diag)
+            size = max(1, min(SIZE_CAP_5TIER, int(round(score))))
+            diag.update({
+                "bb_div_band": bb_div_band,
+                "bps_strong": bps_strong,
+                "side_yes": side_yes,
+                "side_no": side_no,
+                "super_band": super_band,
+                "score_5tier_v13b": score,
+            })
+            # Max possible score = 2 + 1.5 + 2 + 1 = 6.5
+            conf = min(1.0, score / 6.5)
+            return Decision(
+                ticker=ticker, action=Action.ENTER, side=side, size=size,
+                confidence=conf,
+                reason=(f"5TIER_V13B score={score:.1f} -> {size}ct "
+                        f"(div_band={bb_div_band} side_no={side_no} "
+                        f"bps_strong={bps_strong} super_band={super_band})"),
+                diagnostics=diag)
+
+        # ---- align_mode == "disabled": original UPSIZE_2X / ENTER_1X ----
+        if vol_pct < self.vol_upsize_below and bb_div < self.bb_div_upsize_below:
+            return Decision(
+                ticker=ticker, action=Action.ENTER, side=side, size=2,
+                confidence=0.9,
+                reason=(f"UPSIZE_2X: vol_pct {vol_pct:.2f} < {self.vol_upsize_below} "
+                        f"and bb_div {bb_div:+.3f} < {self.bb_div_upsize_below}"),
+                diagnostics=diag)
+        return Decision(
+            ticker=ticker, action=Action.ENTER, side=side, size=1,
+            confidence=0.6, reason="ENTER_1X: passed all cutpoints",
+            diagnostics=diag)
+
+    @staticmethod
+    def _skip(ticker: str, side: Side, why: str, diag: dict) -> Decision:
+        return Decision(
+            ticker=ticker, action=Action.SKIP, side=side, size=0,
+            confidence=0.0, reason=f"SKIP: {why}", diagnostics=diag)
