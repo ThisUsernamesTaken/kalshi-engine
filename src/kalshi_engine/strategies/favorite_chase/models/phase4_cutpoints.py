@@ -103,7 +103,24 @@ SIZE_CAP_5TIER = 5
 SUPER_BAND_LOW = -0.14
 SUPER_BAND_HIGH = -0.09
 
-ALIGN_MODES = ("disabled", "2tier", "3tier", "5tier", "5tier_v13b")
+# Phase 12.12 (V13b S2) — conviction-tiered sizing on the V13b score formula.
+# Same hard gates and score formula as 5tier_v13b, but the size mapping is
+# steeper to make use of --max-contracts 10 headroom on high-conviction trades
+# while SKIPping low-score noise:
+#     score < 3.0  -> SKIP
+#     3.0 <= score < 4.0 -> 3 ct
+#     4.0 <= score < 5.0 -> 5 ct
+#     5.0 <= score < 6.0 -> 8 ct
+#     score >= 6.0       -> 10 ct
+# Counterfactual on n=74 live V13b trades: +$28.12 vs baseline +$20.42,
+# worst-trade loss reduced (-$2.55 vs -$3.40 — sizes the score=3.5 DOGE
+# loser DOWN from 4ct to 3ct). See research notes.
+S2_SKIP_BELOW = 3.0
+S2_SIZE_AT_4 = 5
+S2_SIZE_AT_5 = 8
+S2_SIZE_AT_6 = 10
+
+ALIGN_MODES = ("disabled", "2tier", "3tier", "5tier", "5tier_v13b", "5tier_v13b_s2")
 
 
 class Phase4CutpointsModel:
@@ -356,6 +373,53 @@ class Phase4CutpointsModel:
                 ticker=ticker, action=Action.ENTER, side=side, size=size,
                 confidence=conf,
                 reason=(f"5TIER_V13B score={score:.1f} -> {size}ct "
+                        f"(div_band={bb_div_band} side_no={side_no} "
+                        f"bps_strong={bps_strong} super_band={super_band})"),
+                diagnostics=diag)
+
+        if self.align_mode == "5tier_v13b_s2":
+            # Phase 12.12 — V13b S2 sizing. Same V13b score formula; steeper
+            # conviction-tiered sizing to use --max-contracts 10 headroom.
+            # See module docstring for the tier table and research summary.
+            if s_bps == 0:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_S2 skip: s_bps=0 (bps_margin {bps_margin:.2f} <= "
+                    f"{ALIGN_BPS_MULT}*{threshold:.2f})", diag)
+            bb_div_band = 1 if (DEEP_DIV_SKIP < bb_div <= DIV_BAND_UPPER) else 0
+            side_no = 1 if side is Side.NO else 0
+            side_yes = 1 - side_no
+            bps_strong = 1 if bps_margin > BPS_STRONG_MULT * threshold else 0
+            super_band = 1 if (SUPER_BAND_LOW < bb_div <= SUPER_BAND_HIGH) else 0
+            score = (2.0 * bb_div_band + 1.5 * side_no
+                     + 2.0 * bps_strong + 1.0 * super_band)
+            diag.update({
+                "bb_div_band": bb_div_band,
+                "bps_strong": bps_strong,
+                "side_yes": side_yes,
+                "side_no": side_no,
+                "super_band": super_band,
+                "score_5tier_v13b_s2": score,
+            })
+            if score < S2_SKIP_BELOW:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_S2 skip: score={score:.1f} < {S2_SKIP_BELOW} "
+                    f"(div_band={bb_div_band} side_no={side_no} "
+                    f"bps_strong={bps_strong} super_band={super_band})", diag)
+            if score < 4.0:
+                size = 3
+            elif score < 5.0:
+                size = S2_SIZE_AT_4
+            elif score < 6.0:
+                size = S2_SIZE_AT_5
+            else:
+                size = S2_SIZE_AT_6
+            conf = min(1.0, score / 6.5)
+            return Decision(
+                ticker=ticker, action=Action.ENTER, side=side, size=size,
+                confidence=conf,
+                reason=(f"5TIER_V13B_S2 score={score:.1f} -> {size}ct "
                         f"(div_band={bb_div_band} side_no={side_no} "
                         f"bps_strong={bps_strong} super_band={super_band})"),
                 diagnostics=diag)

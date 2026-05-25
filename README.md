@@ -71,7 +71,7 @@ python -m kalshi_engine.bin.live \
     --strategy favorite_chase \
     --model phase4_cutpoints \
     --cutpoints-version v1 \
-    --align-mode 5tier_v13b \
+    --align-mode 5tier_v13b_s2 \
     --max-contracts 10 \
     --reentry-mode disabled \
     --time-of-day-skip enabled \
@@ -81,6 +81,22 @@ python -m kalshi_engine.bin.live \
     --bps-gate enabled \
     --daily-cap-cents 1000
 ```
+
+`--align-mode 5tier_v13b_s2` is the current production sizing mode
+(Phase 12.12). It uses the validated V13b score formula but with a
+steeper conviction-tiered size mapping that makes use of the
+`--max-contracts 10` headroom on high-conviction trades:
+
+| score | size |
+|---|---|
+| `< 3.0` | SKIP |
+| `[3.0, 4.0)` | 3 ct |
+| `[4.0, 5.0)` | 5 ct |
+| `[5.0, 6.0)` | 8 ct |
+| `>= 6.0` | 10 ct |
+
+The previous mode `5tier_v13b` (caps at 5 ct regardless of score) is
+preserved as a backward-compat option.
 
 `--time-of-day-skip enabled` is the validated default. A brief
 counterfactual run with the gate disabled was reverted after one
