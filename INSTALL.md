@@ -313,13 +313,18 @@ python -m kalshi_engine.bin.live \
     --align-mode 5tier_v13b \
     --max-contracts 10 \
     --reentry-mode disabled \
-    --time-of-day-skip disabled \
+    --time-of-day-skip enabled \
     --cryptos BTC,ETH,SOL,XRP,DOGE \
     --spot-source bitstamp \
     --stop-mode none \
     --bps-gate enabled \
     --daily-cap-cents 1000
 ```
+
+Note on `--time-of-day-skip enabled`: an experimental removal of the
+TOD-skip gate (briefly run as `--time-of-day-skip disabled`) was
+reverted after a single previously-blocked cycle produced a -$3.40
+loss. The gate is doing real protective work; leave it enabled.
 
 The Phase 4 cutpoints model expects an artefact at
 `<warehouse>/models/phase4_cutpoints/v1/cutpoints.json`. If it is

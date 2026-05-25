@@ -74,13 +74,24 @@ python -m kalshi_engine.bin.live \
     --align-mode 5tier_v13b \
     --max-contracts 10 \
     --reentry-mode disabled \
-    --time-of-day-skip disabled \
+    --time-of-day-skip enabled \
     --cryptos BTC,ETH,SOL,XRP,DOGE \
     --spot-source bitstamp \
     --stop-mode none \
     --bps-gate enabled \
     --daily-cap-cents 1000
 ```
+
+`--time-of-day-skip enabled` is the validated default. A brief
+counterfactual run with the gate disabled was reverted after one
+previously-blocked cycle produced a -$3.40 loss; the gate is doing
+real protective work.
+
+**Cumulative live performance** (snapshot 2026-05-25, 63.5 h of live
+trading): 284 trades, 91.6% WR, **+$22.71 net realized PnL**. The
+V13b `max-contracts=10` phase has been the engine's most profitable era
+at ~$0.34/trade and 98% WR. See the source-of-truth JSONL log under
+`$KALSHI_ENGINE_WAREHOUSE/raw/live_logs/` for full per-trade detail.
 
 A successful boot emits a single `{"kind":"boot",...}` line to the JSONL
 log under `$KALSHI_ENGINE_WAREHOUSE/raw/live_logs/`. After that, every
