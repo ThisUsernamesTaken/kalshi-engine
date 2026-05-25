@@ -31,12 +31,17 @@ import numpy as np
 import pandas as pd
 import pytest
 
-# allow `import calibrate_heston` from the script dir
+# allow `import calibrate_heston` from the script dir; the research script
+# lives in scripts/research/ and is not shipped with the distribution, so
+# skip the whole module gracefully if it can't be found.
 _SCRIPT_DIR = Path(__file__).resolve().parent.parent / "scripts" / "research"
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-import calibrate_heston as ch  # noqa: E402
+ch = pytest.importorskip(
+    "calibrate_heston",
+    reason="calibrate_heston research script not present (scripts/research/)",
+)
 
 
 # ---------------------------------------------------------------------------
