@@ -310,7 +310,7 @@ python -m kalshi_engine.bin.live \
     --strategy favorite_chase \
     --model phase4_cutpoints \
     --cutpoints-version v1 \
-    --align-mode 5tier_v13b_s2 \
+    --align-mode 5tier_v13b_h1h4 \
     --max-contracts 10 \
     --reentry-mode disabled \
     --time-of-day-skip enabled \
@@ -321,12 +321,13 @@ python -m kalshi_engine.bin.live \
     --daily-cap-cents 1000
 ```
 
-Note on `--align-mode 5tier_v13b_s2`: conviction-tiered sizing on the
-V13b score formula. Score < 3.0 SKIPs; otherwise size is 3 / 5 / 8 / 10
-ct for score bands [3,4) / [4,5) / [5,6) / [6,6.5]. Uses the
-`--max-contracts 10` headroom on high-conviction trades while pruning
-low-conviction noise. The earlier `5tier_v13b` (caps at 5 ct) remains
-selectable as a backward-compat option.
+Note on `--align-mode 5tier_v13b_h1h4`: H1+H4 mix on the V13b score
+formula. SKIPs all trades with score < 4.0 (skipping the only tier
+that ever lost in cohort, score 3.5), then sizes the rest by
+`min(10, round(score * 1.8))`. Effective sizes by tier: 4.0→7ct,
+4.5→8ct, 5.0→9ct, 5.5+→10ct. The earlier `5tier_v13b_s2` (3/5/8/10
+by tier, includes score 3-4 trades) and `5tier_v13b` (caps at 5 ct)
+remain selectable as backward-compat options.
 
 Note on `--time-of-day-skip enabled`: an experimental removal of the
 TOD-skip gate (briefly run as `--time-of-day-skip disabled`) was

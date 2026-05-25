@@ -88,19 +88,20 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--daily-cap-cents", type=int, default=1000)
     p.add_argument("--align-mode", default="5tier_v13b",
                    choices=["disabled", "2tier", "3tier", "5tier",
-                            "5tier_v13b", "5tier_v13b_s2"],
-                   help="Phase-12 alignment-count sizing mode. '5tier_v13b_s2' "
-                        "(Phase 12.12) = V13b score formula + conviction-tiered "
-                        "sizing: score<3 SKIP, <4 3ct, <5 5ct, <6 8ct, >=6 10ct. "
-                        "Uses --max-contracts 10 headroom on high-conviction "
-                        "trades. '5tier_v13b' (default, Phase 12.6) = V13b "
-                        "validated optimization: score = 2*bb_div_band + "
-                        "1.5*side_no + 2*bps_strong + super_band(+1 if bb_div "
-                        "in (-0.14,-0.09]). Bootstrap 99.7%% > V12. '5tier' "
-                        "(Phase 12.4) = original Scheme B with side_yes weight. "
-                        "'3tier' = align=0 skip, 1->1ct/2->2ct/3->3ct. '2tier' = "
-                        "align<=1 skip, 2->1ct/3->2ct. 'disabled' = legacy "
-                        "UPSIZE_2X.")
+                            "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4"],
+                   help="Phase-12 alignment-count sizing mode. '5tier_v13b_h1h4' "
+                        "(Phase 12.13) = H1 score-floor + H4 smooth multiplier: "
+                        "score<4 SKIP, else size = min(10, round(score*1.8)). "
+                        "Skips the only losing tier (score 3.5) and sizes 7/8/9/10 "
+                        "by tier on what passes. '5tier_v13b_s2' (Phase 12.12) = "
+                        "score<3 SKIP, <4 3ct, <5 5ct, <6 8ct, >=6 10ct. "
+                        "'5tier_v13b' (Phase 12.6) = V13b validated optimization: "
+                        "score = 2*bb_div_band + 1.5*side_no + 2*bps_strong + "
+                        "super_band(+1 if bb_div in (-0.14,-0.09]). Bootstrap "
+                        "99.7%% > V12. '5tier' (Phase 12.4) = original Scheme B "
+                        "with side_yes weight. '3tier' = align=0 skip, "
+                        "1->1ct/2->2ct/3->3ct. '2tier' = align<=1 skip, "
+                        "2->1ct/3->2ct. 'disabled' = legacy UPSIZE_2X.")
     p.add_argument("--reentry-mode", default="disabled",
                    choices=["disabled", "polling"],
                    help="Phase-12.3 re-entry behaviour. 'disabled' (default "

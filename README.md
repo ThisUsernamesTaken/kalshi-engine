@@ -71,7 +71,7 @@ python -m kalshi_engine.bin.live \
     --strategy favorite_chase \
     --model phase4_cutpoints \
     --cutpoints-version v1 \
-    --align-mode 5tier_v13b_s2 \
+    --align-mode 5tier_v13b_h1h4 \
     --max-contracts 10 \
     --reentry-mode disabled \
     --time-of-day-skip enabled \
@@ -82,21 +82,24 @@ python -m kalshi_engine.bin.live \
     --daily-cap-cents 1000
 ```
 
-`--align-mode 5tier_v13b_s2` is the current production sizing mode
-(Phase 12.12). It uses the validated V13b score formula but with a
-steeper conviction-tiered size mapping that makes use of the
-`--max-contracts 10` headroom on high-conviction trades:
+`--align-mode 5tier_v13b_h1h4` is the current production sizing mode
+(Phase 12.13). It combines H1's score floor (skip every cohort losing
+tier — score 3.5 was the only tier with losses) with H4's smooth
+score-multiplier sizing on what passes:
 
 | score | size |
 |---|---|
-| `< 3.0` | SKIP |
-| `[3.0, 4.0)` | 3 ct |
-| `[4.0, 5.0)` | 5 ct |
-| `[5.0, 6.0)` | 8 ct |
-| `>= 6.0` | 10 ct |
+| `< 4.0` | SKIP |
+| `= 4.0` | 7 ct |
+| `= 4.5` | 8 ct |
+| `= 5.0` | 9 ct |
+| `>= 5.5` | 10 ct (capped) |
 
-The previous mode `5tier_v13b` (caps at 5 ct regardless of score) is
-preserved as a backward-compat option.
+Sizing formula: `size = min(10, round(score * 1.8))`.
+
+Counterfactual on the n=88 V13b live cohort: **+$37.78** vs S2 +$30.37
+(+24%) with 100% WR on the kept set. Earlier modes `5tier_v13b_s2` and
+`5tier_v13b` are preserved as backward-compat options.
 
 `--time-of-day-skip enabled` is the validated default. A brief
 counterfactual run with the gate disabled was reverted after one
