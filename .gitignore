@@ -16,7 +16,7 @@ credentials/
 *.sqlite-shm
 *.parquet
 *.db
-warehouse/
+/warehouse/
 
 # Python build / cache
 __pycache__/
