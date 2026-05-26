@@ -31,10 +31,16 @@ from math import log
 from statistics import NormalDist
 
 from kalshi_engine.core.events import BookEvent, LifecycleEvent, SettlementEvent, SpotEvent
+from kalshi_engine.research.sr_features import all_sr_features
 from kalshi_engine.risk.envelope import crypto_of_ticker
 from kalshi_engine.strategies.favorite_chase.state import FavoriteChaseState
 
 _NORM = NormalDist()
+
+# 24h+1h slack retention for the S/R feature buffers. Independent of
+# FavoriteChaseState.spot_buffer (32m) so the long-window BB/pivot features
+# have enough history at envelope time.
+_LONG_BUFFER_MS = 25 * 3_600_000
 
 
 @dataclass(frozen=True)
@@ -62,6 +68,7 @@ class HourglassObserverStrategy:
         self,
         log_writer,
         observe_minutes: tuple[int, ...] = (30, 40, 45, 50, 55),
+        liquidity_poller=None,
     ) -> None:
         if log_writer is None:
             raise ValueError("HourglassObserverStrategy requires a log_writer")
@@ -73,6 +80,14 @@ class HourglassObserverStrategy:
         # Per-ticker per-window: True iff already emitted for that window
         # in this cycle. Cleared on settlement.
         self._sampled: dict[str, set[int]] = {}
+        # Phase 14.2a — long-window spot history (24h+) per crypto for S/R
+        # features. FavoriteChaseState.spot_buffer caps at 32m which is too
+        # short for 4h/24h Bollinger / pivot windows. List of (ts_ms, price).
+        self._long_spot_history: dict[str, list[tuple[int, float]]] = {}
+        # Optional liquidity poller — must expose .get_depth(crypto) -> dict
+        # with keys bid_depth, ask_depth, spread_bps (or any subset). None
+        # means liquidity fields will be omitted from envelopes.
+        self._liquidity_poller = liquidity_poller
 
     # -- registration ---------------------------------------------------------
     def register_market(self, ticker: str, strike: float,
@@ -91,7 +106,15 @@ class HourglassObserverStrategy:
     def on_event(self, event, model=None):
         """Route one event. Always returns None — never emits Decisions."""
         if isinstance(event, SpotEvent):
-            self._state(event.crypto.value).update_spot(event)
+            crypto = event.crypto.value
+            self._state(crypto).update_spot(event)
+            # Phase 14.2a — also append to the long buffer for S/R features.
+            buf = self._long_spot_history.setdefault(crypto, [])
+            buf.append((event.ts_ms, event.price))
+            cutoff = event.ts_ms - _LONG_BUFFER_MS
+            # Trim in-place (last-touched timestamp is monotonic).
+            while buf and buf[0][0] < cutoff:
+                buf.pop(0)
             return None
         if isinstance(event, BookEvent):
             self._on_book(event)
@@ -178,6 +201,26 @@ class HourglassObserverStrategy:
         yes_ask_size = _size_at(book.yes_levels, book.yes_ask)
         no_bid_size = _size_at(book.no_levels, book.no_bid)
         no_ask_size = _size_at(book.no_levels, book.no_ask)
+        # Phase 14.2a — S/R features from the long spot history.
+        long_hist = self._long_spot_history.get(crypto, [])
+        sr = all_sr_features(spot, long_hist, book.recv_ms)
+        # Optional liquidity poll (Bitstamp depth). Cached/throttled by the
+        # poller itself — we just ask for fresh-ish data here.
+        liq = {}
+        if self._liquidity_poller is not None:
+            try:
+                d = self._liquidity_poller.get_depth(crypto)
+                if d:
+                    liq = {
+                        "bitstamp_bid_depth_0p5pct": d.get("bid_depth_0p5pct"),
+                        "bitstamp_ask_depth_0p5pct": d.get("ask_depth_0p5pct"),
+                        "bitstamp_bid_depth_1pct": d.get("bid_depth_1pct"),
+                        "bitstamp_ask_depth_1pct": d.get("ask_depth_1pct"),
+                        "bitstamp_spread_bps": d.get("spread_bps"),
+                        "bitstamp_mid": d.get("mid"),
+                    }
+            except Exception as exc:
+                liq = {"bitstamp_poll_error": repr(exc)[:80]}
         self._log.write({
             "kind": "book_at_1hr_pretrigger",
             "ticker": book.ticker,
@@ -200,4 +243,17 @@ class HourglassObserverStrategy:
             "favorite_side": fav_side,
             "favorite_mid_decicents": fav_mid,
             "strike": meta.strike,
+            # Phase 14.2a S/R features
+            "bb_pos_1h": sr.get("bb_pos_1h"),
+            "bb_pos_4h": sr.get("bb_pos_4h"),
+            "bb_pos_24h": sr.get("bb_pos_24h"),
+            "pivot": sr.get("pivot"),
+            "pivot_R1": sr.get("pivot_R1"),
+            "pivot_S1": sr.get("pivot_S1"),
+            "dist_to_R1": sr.get("dist_to_R1"),
+            "dist_to_S1": sr.get("dist_to_S1"),
+            "window_24h_high": sr.get("window_high"),
+            "window_24h_low": sr.get("window_low"),
+            "long_history_n": len(long_hist),
+            **liq,
         })

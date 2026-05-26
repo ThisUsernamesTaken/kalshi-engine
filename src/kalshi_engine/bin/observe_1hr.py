@@ -23,6 +23,7 @@ from kalshi_engine.core.events import (
 )
 from kalshi_engine.core.types import Crypto
 from kalshi_engine.execution.kalshi_client import KalshiClient
+from kalshi_engine.feeds.bitstamp_depth import BitstampDepthPoller
 from kalshi_engine.feeds.kalshi_ws import KalshiWebSocketFeed
 from kalshi_engine.feeds.spot_ws import SpotFeed
 from kalshi_engine.strategies.hourglass_observer import HourglassObserverStrategy
@@ -266,11 +267,17 @@ async def _amain(args: argparse.Namespace) -> int:
         return 2
 
     log = LiveLogWriter(args.log_path)
-    observer = HourglassObserverStrategy(log_writer=log, observe_minutes=observe_times)
+    # Phase 14.2a — Bitstamp depth poller (TTL-cached, 30s default) feeds
+    # each envelope with ±0.5%/±1% depth + spread for the underlying.
+    depth_poller = BitstampDepthPoller(ttl_seconds=30.0)
+    observer = HourglassObserverStrategy(
+        log_writer=log, observe_minutes=observe_times,
+        liquidity_poller=depth_poller,
+    )
     spot_feed = SpotFeed(cryptos, spot_source=args.spot_source)
 
     _diag("entering KalshiClient")
-    async with KalshiClient(api_key, pem_bytes) as client:
+    async with KalshiClient(api_key, pem_bytes) as client, depth_poller:
         _diag("discovery start")
         markets = await _discover_1hr_markets(client, cryptos, log)
         _diag(f"discovered {len(markets)} 1hr markets")
@@ -305,14 +312,30 @@ async def _amain(args: argparse.Namespace) -> int:
             client, observer, cryptos, log, interval_seconds=60.0,
             kalshi_ws=kalshi_ws,
         ))
+        # Phase 14.2a — background Bitstamp depth refresh (every 20s per crypto,
+        # well under the 30s cache TTL so get_depth is never stale at emit time).
+        async def _depth_refresh_loop():
+            while True:
+                for c in cryptos:
+                    try:
+                        await depth_poller.refresh(c.value)
+                    except Exception as exc:
+                        log.write({"kind": "depth_refresh_error",
+                                    "crypto": c.value, "error": repr(exc)[:80]})
+                try:
+                    await asyncio.sleep(20.0)
+                except asyncio.CancelledError:
+                    return
+        depth_task = asyncio.create_task(_depth_refresh_loop())
         try:
             await _run_loop(observer, kalshi_ws, spot_feed, log, args.duration_s)
         finally:
-            discovery_task.cancel()
-            try:
-                await discovery_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            for t in (discovery_task, depth_task):
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
         log.write({"kind": "shutdown", "process": "hourglass_observer"})
     return 0
 
