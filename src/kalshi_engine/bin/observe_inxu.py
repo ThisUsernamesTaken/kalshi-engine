@@ -82,8 +82,19 @@ def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="kalshi_engine equity-index observer (KXINXU / KXNASDAQ100U)")
     p.add_argument("--equities", default="SPX",
                    help="comma-separated equity symbols (SPX,NDX). Default SPX only for tight scope.")
-    p.add_argument("--observe-times", default="30,40,50",
-                   help="minutes into cycle to sample (default 30,40,50)")
+    p.add_argument("--observe-times", default="5,10,15,20,25,30,40,50",
+                   help="minutes into cycle to sample. Default "
+                        "5,10,15,20,25,30,40,50 (Phase 14.4 — intra-cycle "
+                        "coverage). The KXINXU trader's 808 decisions at "
+                        "T+30/40/50 showed 0 tradeable favorites; need "
+                        "earlier sampling because SPX pins faster than "
+                        "crypto due to point-in-time settlement.")
+    p.add_argument("--discovery-interval-s", type=float, default=300.0,
+                   help="How often to refresh KXINXU/KXNASDAQ100U market "
+                        "registration from Kalshi REST. Default 300s. Phase "
+                        "14.4 — fixes the defect where boot-time-only "
+                        "registration left the observer blind after cycle "
+                        "rollovers.")
     p.add_argument("--log-path", default=DEFAULT_LOG_PATH,
                    help="JSONL output path")
     p.add_argument("--duration-s", type=float, default=0.0,
@@ -263,8 +274,86 @@ async def _amain(args: argparse.Namespace) -> int:
             tickers = list(state.markets.keys())
             kalshi_ws = KalshiWebSocketFeed(client, tickers)
             _diag("entering run loop")
-            await _run_loop(kalshi_ws, state, alpaca, log, args.duration_s)
+            # Phase 14.4 — periodic market discovery refresh so cycle
+            # rollovers don't leave the observer blind. The defect was
+            # that boot-time-only registration meant once the initial
+            # cycles settled, no new envelopes fired.
+            discovery_task = asyncio.create_task(
+                _discovery_loop(client, equities, state, kalshi_ws, log,
+                                 interval_seconds=args.discovery_interval_s))
+            try:
+                await _run_loop(kalshi_ws, state, alpaca, log, args.duration_s)
+            finally:
+                discovery_task.cancel()
+                try:
+                    await discovery_task
+                except (asyncio.CancelledError, Exception):
+                    pass
     return 0
+
+
+async def _discovery_loop(client: KalshiClient, equities: list,
+                           state, kalshi_ws,
+                           log: LiveLogWriter,
+                           interval_seconds: float = 300.0) -> None:
+    """Periodically poll Kalshi REST for new KXINXU/KXNASDAQ100U markets
+    and register them with the observer. Also extends the WS subscription
+    so book events flow for the new tickers."""
+    from collections import defaultdict
+    while True:
+        try:
+            await asyncio.sleep(interval_seconds)
+        except asyncio.CancelledError:
+            return
+        try:
+            newly: dict[str, list[str]] = defaultdict(list)
+            for eq in equities:
+                spec = SPECS[eq]
+                try:
+                    markets = await client.list_markets(
+                        series_ticker=spec.kalshi_series,
+                        status="open", limit=200,
+                    )
+                except Exception as exc:
+                    log.write({"kind": "discovery_error",
+                               "series": spec.kalshi_series,
+                               "error": repr(exc)})
+                    continue
+                for m in markets:
+                    ticker = m.get("ticker")
+                    if not ticker or ticker in state.markets:
+                        continue
+                    strike = _strike_from_market(m)
+                    open_ms = _iso_to_ms(m.get("open_time"))
+                    close_ms = _iso_to_ms(m.get("close_time"))
+                    if strike <= 0 or open_ms is None or close_ms is None:
+                        continue
+                    state.register(ticker, strike, open_ms, close_ms,
+                                    spec.kalshi_series, eq)
+                    newly[spec.kalshi_series].append(ticker)
+            if newly:
+                log.write({
+                    "kind": "market_discovery",
+                    "newly_registered_count": sum(len(v) for v in newly.values()),
+                    "total_registered": len(state.markets),
+                    "by_series": {s: len(t) for s, t in newly.items()},
+                })
+                # Extend WS subscription
+                new_tickers = [t for ts in newly.values() for t in ts]
+                if new_tickers and hasattr(kalshi_ws, "add_tickers"):
+                    try:
+                        added = await kalshi_ws.add_tickers(new_tickers)
+                        log.write({"kind": "ws_subscription_extended",
+                                    "added_count": added,
+                                    "tickers": new_tickers[:5] +
+                                                (["..."] if len(new_tickers) > 5 else [])})
+                    except Exception as exc:
+                        log.write({"kind": "ws_subscription_extend_error",
+                                    "error": repr(exc)})
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            log.write({"kind": "discovery_loop_error", "error": repr(exc)})
 
 
 async def _run_loop(kalshi_ws, state, alpaca, log, duration_s: float) -> None:

@@ -87,8 +87,14 @@ def parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="kalshi_engine hourglass 1hr observer")
     p.add_argument("--cryptos", default="BTC,ETH,SOL,XRP,DOGE",
                    help="comma-separated crypto symbols")
-    p.add_argument("--observe-times", default="30,40,45,50,55",
-                   help="comma-separated minutes into cycle to sample (default 30,40,45,50,55)")
+    p.add_argument("--observe-times", default="5,10,15,20,25,30,40,45,50,55",
+                   help="comma-separated minutes into cycle to sample. "
+                        "Default 5,10,15,20,25,30,40,45,50,55 (Phase 14.4 — "
+                        "intra-cycle coverage to locate the optimal T+x for "
+                        "each product). Earlier windows added because the "
+                        "Phase 14.2a observer data showed favorites are "
+                        "already pinned (med >$0.99) by T+30 across all 1hr "
+                        "cryptos; the action is BEFORE T+30, not after.")
     p.add_argument("--spot-source", default="bitstamp",
                    choices=["bitstamp", "bitstamp-ws", "coinbase"],
                    help="spot price source")
