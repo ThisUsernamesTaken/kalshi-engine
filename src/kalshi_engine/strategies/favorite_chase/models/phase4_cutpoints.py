@@ -137,6 +137,22 @@ S2_SIZE_AT_6 = 10
 H1H4_SKIP_BELOW = 4.0
 H1H4_SCORE_MULT = 1.8
 
+# Phase 13.4 (V13b H1H4 LOOSE) — targeted score-floor relaxation. Same V13b
+# score formula + H1H4 sizing for score >= 4.0. For score in [3.0, 4.0)
+# (the "borderline" band), ENTERs at 3 ct IFF the existing validated edge
+# is present: bb_div_band == 1 AND vol_30m_pct < 0.5. Otherwise SKIPs.
+#
+# Calibrated from a 15m-engine post-mortem on n=13 historical score-3.0
+# winners: every single one had bb_div_band=1, every single one was a
+# WIN (+$3.26 / 100% WR). The 3 historical score<2.5 losers all had
+# vol_30m_pct >= 0.41 — the vol gate excludes that regime conservatively.
+# Projected lift: +~$7/week on 15m engine. n=13/0 fragile; ship as a
+# selectable mode (not default) so rollback is a flag flip.
+LOOSE_SCORE_FLOOR = 3.0
+LOOSE_BORDERLINE_HI = 4.0
+LOOSE_VOL_PCT_MAX = 0.5
+LOOSE_SIZE_BORDERLINE = 3
+
 # Phase 13.1 (V13b 1to3 flat) — compressed-sizing variant for the new 1hr
 # live engine. Same V13b score formula and hard gates as 5tier_v13b. SKIPs
 # everything below score=4.0 (H1 floor — every V13b cohort loss sits at
@@ -188,7 +204,7 @@ DOGE_BPS_FLOOR = 10.0
 ALIGN_MODES = ("disabled", "2tier", "3tier", "5tier",
                "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4",
                "5tier_v13b_1to3_flat", "5tier_v13b_10_flat",
-               "5tier_v13b_7_10_10")
+               "5tier_v13b_7_10_10", "5tier_v13b_h1h4_loose")
 
 
 class Phase4CutpointsModel:
@@ -539,6 +555,67 @@ class Phase4CutpointsModel:
                 ticker=ticker, action=Action.ENTER, side=side, size=size,
                 confidence=conf,
                 reason=(f"5TIER_V13B_H1H4 score={score:.1f} -> {size}ct "
+                        f"(div_band={bb_div_band} side_no={side_no} "
+                        f"bps_strong={bps_strong} super_band={super_band})"),
+                diagnostics=diag)
+
+        if self.align_mode == "5tier_v13b_h1h4_loose":
+            # Phase 13.4 — H1H4 with a targeted relaxation in [3.0, 4.0).
+            # For score >= 4.0, identical to 5tier_v13b_h1h4 (skip<4, smooth
+            # multiplier). For score in [3.0, 4.0), ENTERs 3ct IFF the
+            # validated bb_div sweet-spot edge is present AND vol is sub-mid.
+            if s_bps == 0:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_H1H4_LOOSE skip: s_bps=0 (bps_margin "
+                    f"{bps_margin:.2f} <= {ALIGN_BPS_MULT}*{threshold:.2f})", diag)
+            bb_div_band = 1 if (DEEP_DIV_SKIP < bb_div <= DIV_BAND_UPPER) else 0
+            side_no = 1 if side is Side.NO else 0
+            side_yes = 1 - side_no
+            bps_strong = 1 if bps_margin > BPS_STRONG_MULT * threshold else 0
+            super_band = 1 if (SUPER_BAND_LOW < bb_div <= SUPER_BAND_HIGH) else 0
+            score = (2.0 * bb_div_band + 1.5 * side_no
+                     + 2.0 * bps_strong + 1.0 * super_band)
+            diag.update({
+                "bb_div_band": bb_div_band,
+                "bps_strong": bps_strong,
+                "side_yes": side_yes,
+                "side_no": side_no,
+                "super_band": super_band,
+                "score_5tier_v13b_h1h4_loose": score,
+            })
+            if score < LOOSE_SCORE_FLOOR:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_H1H4_LOOSE skip: score={score:.1f} < "
+                    f"{LOOSE_SCORE_FLOOR} (div_band={bb_div_band} "
+                    f"side_no={side_no} bps_strong={bps_strong} "
+                    f"super_band={super_band})", diag)
+            if score < LOOSE_BORDERLINE_HI:
+                # Borderline tier [3.0, 4.0): gate on validated edge + vol.
+                if bb_div_band != 1:
+                    return self._skip(
+                        ticker, side,
+                        f"5TIER_V13B_H1H4_LOOSE borderline skip: "
+                        f"score={score:.1f} but bb_div_band=0 (bb_div="
+                        f"{bb_div:+.3f} outside ({DEEP_DIV_SKIP}, "
+                        f"{DIV_BAND_UPPER}])", diag)
+                if vol_pct >= LOOSE_VOL_PCT_MAX:
+                    return self._skip(
+                        ticker, side,
+                        f"5TIER_V13B_H1H4_LOOSE borderline skip: "
+                        f"score={score:.1f} but vol_pct={vol_pct:.2f} >= "
+                        f"{LOOSE_VOL_PCT_MAX} (validated edge requires sub-mid vol)",
+                        diag)
+                size = LOOSE_SIZE_BORDERLINE
+            else:
+                # Identical to H1H4 above this point.
+                size = min(S2_SIZE_AT_6, int(round(score * H1H4_SCORE_MULT)))
+            conf = min(1.0, score / 6.5)
+            return Decision(
+                ticker=ticker, action=Action.ENTER, side=side, size=size,
+                confidence=conf,
+                reason=(f"5TIER_V13B_H1H4_LOOSE score={score:.1f} -> {size}ct "
                         f"(div_band={bb_div_band} side_no={side_no} "
                         f"bps_strong={bps_strong} super_band={super_band})"),
                 diagnostics=diag)

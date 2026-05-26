@@ -86,14 +86,18 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "100%% WR backtest. Worst single-trade loss now "
                         "~$9.50 at 10ct * 95c.")
     p.add_argument("--daily-cap-cents", type=int, default=1000)
-    p.add_argument("--align-mode", default="5tier_v13b",
+    p.add_argument("--align-mode", default="5tier_v13b_h1h4_loose",
                    choices=["disabled", "2tier", "3tier", "5tier",
-                            "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4"],
-                   help="Phase-12 alignment-count sizing mode. '5tier_v13b_h1h4' "
-                        "(Phase 12.13) = H1 score-floor + H4 smooth multiplier: "
-                        "score<4 SKIP, else size = min(10, round(score*1.8)). "
-                        "Skips the only losing tier (score 3.5) and sizes 7/8/9/10 "
-                        "by tier on what passes. '5tier_v13b_s2' (Phase 12.12) = "
+                            "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4",
+                            "5tier_v13b_h1h4_loose"],
+                   help="Phase-12 alignment-count sizing mode. '5tier_v13b_h1h4_loose' "
+                        "(Phase 13.4, default) = H1H4 with a targeted relaxation in "
+                        "score [3.0, 4.0): ENTER 3ct iff bb_div_band=1 AND vol_pct<0.5. "
+                        "Motivated by 13/13 cohort wins in the 2.5-3.5 band sharing "
+                        "bb_div_band=1 + calm vol. Score>=4 sizing is identical to "
+                        "'5tier_v13b_h1h4' (Phase 12.13) = H1 score-floor + H4 smooth "
+                        "multiplier: score<4 SKIP, else size = min(10, round(score*1.8)). "
+                        "Sizes 7/8/9/10 by tier on what passes. '5tier_v13b_s2' (Phase 12.12) = "
                         "score<3 SKIP, <4 3ct, <5 5ct, <6 8ct, >=6 10ct. "
                         "'5tier_v13b' (Phase 12.6) = V13b validated optimization: "
                         "score = 2*bb_div_band + 1.5*side_no + 2*bps_strong + "

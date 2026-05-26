@@ -72,7 +72,7 @@ python -m kalshi_engine.bin.live \
     --strategy favorite_chase \
     --model phase4_cutpoints \
     --cutpoints-version v1 \
-    --align-mode 5tier_v13b_h1h4 \
+    --align-mode 5tier_v13b_h1h4_loose \
     --max-contracts 10 \
     --reentry-mode disabled \
     --time-of-day-skip enabled \
@@ -83,24 +83,31 @@ python -m kalshi_engine.bin.live \
     --daily-cap-cents 1000
 ```
 
-`--align-mode 5tier_v13b_h1h4` is the current production sizing mode
-(Phase 12.13). It combines H1's score floor (skip every cohort losing
-tier — score 3.5 was the only tier with losses) with H4's smooth
-score-multiplier sizing on what passes:
+`--align-mode 5tier_v13b_h1h4_loose` is the current production sizing
+mode (Phase 13.4). It extends `5tier_v13b_h1h4` (Phase 12.13) with a
+targeted relaxation in the [3.0, 4.0) score band: ENTER 3ct iff the
+validated `bb_div_band=1` edge is present AND `vol_pct < 0.5`. For score
+>= 4.0, sizing is identical to H1H4 — H1's score-floor (skip cohort
+losing tier — score 3.5) plus H4's smooth multiplier on what passes:
 
 | score | size |
 |---|---|
-| `< 4.0` | SKIP |
+| `< 3.0` | SKIP |
+| `[3.0, 4.0)` + `bb_div_band=1` + `vol_pct<0.5` | 3 ct |
+| `[3.0, 4.0)` otherwise | SKIP |
 | `= 4.0` | 7 ct |
 | `= 4.5` | 8 ct |
 | `= 5.0` | 9 ct |
 | `>= 5.5` | 10 ct (capped) |
 
-Sizing formula: `size = min(10, round(score * 1.8))`.
+Loose-band motivation: 13/13 historical cohort wins in score 2.5-3.5 all
+shared `bb_div_band=1` + calm vol — a clean signal worth a bounded
+3ct exposure. Score>=4 sizing formula: `size = min(10, round(score * 1.8))`.
 
-Counterfactual on the n=88 V13b live cohort: **+$37.78** vs S2 +$30.37
-(+24%) with 100% WR on the kept set. Earlier modes `5tier_v13b_s2` and
-`5tier_v13b` are preserved as backward-compat options.
+Counterfactual on the n=88 V13b live cohort (H1H4): **+$37.78** vs S2
++$30.37 (+24%) with 100% WR on the kept set. Earlier modes
+`5tier_v13b_h1h4`, `5tier_v13b_s2` and `5tier_v13b` are preserved as
+backward-compat options.
 
 `--time-of-day-skip enabled` is the validated default. A brief
 counterfactual run with the gate disabled was reverted after one

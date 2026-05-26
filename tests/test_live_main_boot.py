@@ -24,7 +24,7 @@ def test_parse_args_defaults():
     assert args.max_contracts == 10  # Phase-12.7: lifted from 5
     assert args.daily_cap_cents == 1000
     assert args.dry_run is False
-    assert args.align_mode == "5tier_v13b"  # Phase-12.6 default
+    assert args.align_mode == "5tier_v13b_h1h4_loose"  # Phase-13.4 default
     assert args.reentry_mode == "disabled"  # Phase-12.5 Rec 1
     assert args.time_of_day_skip == "enabled"  # Phase-12.5 Rec 2
     assert args.cutpoints_version == "v3"  # Phase-12.5 Rec 3
@@ -159,7 +159,7 @@ def test_boot_writes_event(tmp_path, monkeypatch, mock_creds):
     assert boot["bps_gate"] == "enabled"
     assert boot["max_contracts"] == 10  # Phase-12.7 default
     assert boot["daily_cap_cents"] == 1000
-    assert boot["align_mode"] == "5tier_v13b"  # Phase-12.6 default
+    assert boot["align_mode"] == "5tier_v13b_h1h4_loose"  # Phase-13.4 default
     assert boot["pre_trigger_observation"] == "enabled"  # Phase-12.8
     assert boot["reentry_mode"] == "disabled"  # Phase-12.5 Rec 1
     assert boot["time_of_day_skip"] == "enabled"  # Phase-12.5 Rec 2
