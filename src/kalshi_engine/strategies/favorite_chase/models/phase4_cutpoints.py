@@ -325,6 +325,14 @@ class Phase4CutpointsModel:
         s_bps = 1 if bps_margin > ALIGN_BPS_MULT * threshold else 0
         alignment_count = s_vol + s_div + s_bps
 
+        # Phase 14.7 - d_norm = bps_margin / (vol_30m * sqrt(tau_min)). The
+        # vol-normalized distance-to-strike. Distance analysis flagged
+        # d_norm in [1.5, 2.0] as the loser-cluster band; logging now so
+        # we can backtest a Phase 14.8 hard gate after more data.
+        d_norm = None
+        if vol is not None and vol > 0 and tau > 0:
+            d_norm = bps_margin / (vol * (tau ** 0.5))
+
         diag.update({
             "vol_30m_pct": vol_pct,
             "sigma_per_min": sigma,
@@ -334,6 +342,7 @@ class Phase4CutpointsModel:
             "bb_div": bb_div,
             "bps_margin": bps_margin,
             "bps_threshold": threshold,
+            "d_norm": d_norm,
             "s_vol": s_vol,
             "s_div": s_div,
             "s_bps": s_bps,

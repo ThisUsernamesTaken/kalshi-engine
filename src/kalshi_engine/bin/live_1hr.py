@@ -336,6 +336,8 @@ async def _run_loop(
     client: KalshiClient,
     cryptos: list[Crypto],
     discovery_interval_s: float = 60.0,
+    log_path: str | None = None,
+    pnl_reconcile_interval_s: float = 30.0,
 ) -> None:
     """Merge events from both feeds, route to strategy, gate, submit."""
     queue: asyncio.Queue = asyncio.Queue()
@@ -362,6 +364,31 @@ async def _run_loop(
         interval_seconds=discovery_interval_s,
         kalshi_ws=kalshi_ws,
     ))
+    # Phase 14.7 — periodic PnL reconcile to populate
+    # risk_state.daily_realized_cents from the engine's own JSONL log.
+    # Fixes the long-standing defect where the daily-loss-cap check at
+    # envelope.py:87 was unenforced because the counter was never written.
+    async def _pnl_reconcile_loop():
+        from kalshi_engine.risk.pnl_reconcile import reconcile_today_realized_cents
+        import time as _t
+        last_value = None
+        while True:
+            try:
+                cents = reconcile_today_realized_cents(log_path) if log_path else 0
+                if cents != last_value:
+                    log.write({"kind": "cap_status",
+                               "daily_realized_cents": cents,
+                               "daily_cap_cents": envelope.daily_loss_cap_cents,
+                               "bound": cents <= -envelope.daily_loss_cap_cents})
+                    last_value = cents
+                risk_state.daily_realized_cents = cents
+            except Exception as exc:
+                log.write({"kind": "pnl_reconcile_error", "error": repr(exc)[:120]})
+            try:
+                await asyncio.sleep(pnl_reconcile_interval_s)
+            except asyncio.CancelledError:
+                return
+    pnl_task = asyncio.create_task(_pnl_reconcile_loop())
 
     try:
         while True:
@@ -400,7 +427,7 @@ async def _run_loop(
                               if "decision" in dir() else None,
                 })
     finally:
-        for task in (spot_task, ws_task, listener_task, discovery_task):
+        for task in (spot_task, ws_task, listener_task, discovery_task, pnl_task):
             if task is None:
                 continue
             task.cancel()
@@ -565,6 +592,23 @@ async def _amain(args: argparse.Namespace) -> int:
         _diag(f"boot reconcile done; local positions="
               f"{len(getattr(strategy, '_entered', set()))}")
 
+        # Phase 14.7 — reconcile today's realized PnL from the log so the
+        # daily-cap counter starts in the right state across restarts.
+        try:
+            from kalshi_engine.risk.pnl_reconcile import reconcile_today_realized_cents
+            boot_cents = reconcile_today_realized_cents(str(args.log_path))
+            risk_state.daily_realized_cents = boot_cents
+            log.write({"kind": "cap_status", "stage": "boot_reconcile",
+                       "daily_realized_cents": boot_cents,
+                       "daily_cap_cents": envelope.daily_loss_cap_cents,
+                       "bound": boot_cents <= -envelope.daily_loss_cap_cents})
+            _diag(f"boot pnl reconcile: {boot_cents}c "
+                  f"(cap {envelope.daily_loss_cap_cents}c, "
+                  f"bound={boot_cents <= -envelope.daily_loss_cap_cents})")
+        except Exception as exc:
+            log.write({"kind": "boot_pnl_reconcile_error",
+                       "error": repr(exc)[:120]})
+
         _diag("draining spot warmup into strategy + risk_state ...")
         warmup_n = 0
         try:
@@ -612,6 +656,7 @@ async def _amain(args: argparse.Namespace) -> int:
                 spot_feed=spot_feed, log=log,
                 duration_s=args.duration_s,
                 client=client, cryptos=cryptos,
+                log_path=str(args.log_path),
             )
         finally:
             log.write({"kind": "shutdown", "process": "hourglass_trader"})

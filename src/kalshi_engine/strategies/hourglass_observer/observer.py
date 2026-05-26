@@ -175,6 +175,12 @@ class HourglassObserverStrategy:
         # bb_div: constant-vol Brownian bridge (best-effort; None if no spot/vol).
         bb_div = None
         bps_margin = None
+        # Phase 14.7 - d_norm = bps_margin / (vol_30m * sqrt(tau_min)). The
+        # vol-normalized Brownian-bridge distance to strike. Distance analysis
+        # at _tmp_analysis/distance_per_rung_1hr/ found d_norm in [1.5, 2.0]
+        # is the "looks safe but isn't" loser-cluster band; instrumenting
+        # here so future ENTERs can be backtested + (Phase 14.8) gated.
+        d_norm = None
         if spot is not None and vol is not None and meta.strike > 0:
             sigma = vol / 1e4
             tau = (meta.close_ms - book.recv_ms) / 60_000.0
@@ -188,6 +194,10 @@ class HourglassObserverStrategy:
                 except (ValueError, ZeroDivisionError):
                     pass
             bps_margin = abs(spot - meta.strike) / meta.strike * 1e4
+            if vol > 0 and tau > 0:
+                # bps_margin is already in bps; vol*sqrt(tau) yields bps too
+                # (vol is bps/min, tau is min).
+                d_norm = bps_margin / (vol * (tau ** 0.5))
         # Phase 13.3: top-of-book depth from the level ladders. Each
         # `yes_levels` / `no_levels` entry is (price_decicents, size_contracts);
         # the bid is the entry whose price matches `yes_bid`, the ask is
@@ -240,6 +250,7 @@ class HourglassObserverStrategy:
             "vol_30m": vol,
             "bb_div": bb_div,
             "bps_margin": bps_margin,
+            "d_norm": d_norm,
             "favorite_side": fav_side,
             "favorite_mid_decicents": fav_mid,
             "strike": meta.strike,
