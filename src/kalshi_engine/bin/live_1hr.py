@@ -49,6 +49,32 @@ from kalshi_engine.warehouse.settlement import _iso_to_ms
 
 DEFAULT_LOG_PATH = RAW_DIR / "live_logs" / "live_hourglass_trader.jsonl"
 
+
+def _strike_from_market(m: dict) -> float:
+    """Best-effort strike extraction.
+
+    Kalshi 1hr crypto markets fall into two schemas:
+    - KXBTCD/KXETHD/KXSOLD/KXXRPD: ``floor_strike`` is a float in the payload.
+    - KXDOGED (and likely KXHYPED, KXBNBD): ``floor_strike`` is null; the
+      strike is encoded in the ticker as the segment after the last ``-T``
+      (e.g. ``KXDOGED-26MAY2617-T0.1949999`` -> 0.1949999).
+    Returns 0.0 if no strike can be recovered (discovery skips those).
+    """
+    fs = m.get("floor_strike")
+    if fs is not None:
+        try:
+            return float(fs)
+        except (TypeError, ValueError):
+            pass
+    ticker = m.get("ticker") or ""
+    idx = ticker.rfind("-T")
+    if idx == -1:
+        return 0.0
+    try:
+        return float(ticker[idx + 2:])
+    except (TypeError, ValueError):
+        return 0.0
+
 SERIES_1HR_FOR_CRYPTO = {
     Crypto.BTC: "KXBTCD",
     Crypto.ETH: "KXETHD",
@@ -78,13 +104,15 @@ def parse_args(argv=None) -> argparse.Namespace:
                    choices=["favorite_chase"])
     p.add_argument("--model", default="phase4_cutpoints",
                    choices=["phase4_cutpoints"])
-    p.add_argument("--cryptos", default="BTC,ETH",
-                   help="comma-separated crypto symbols. Default BTC+ETH — "
-                        "Kalshi has 7 1hr crypto series but only KXBTCD (463ct "
-                        "@ 50c) and KXETHD (217ct @ 50c) have the book depth "
-                        "needed for reliable 3ct fills. KXSOLD / KXXRPD / "
-                        "KXDOGED / KXHYPED / KXBNBD are all 1-2ct deep and "
-                        "would risk partial fills or price slip at 3ct sizing.")
+    p.add_argument("--cryptos", default="BTC",
+                   help="comma-separated crypto symbols. Default BTC-only — "
+                        "Kalshi has 7 1hr crypto series but only KXBTCD has "
+                        "deep enough book (463ct @ 50c) to reliably fill 3ct "
+                        "orders without partial-fill or price-slip risk. "
+                        "KXETHD (217ct @ 50c) is the next-best and could be "
+                        "added back via --cryptos BTC,ETH. KXSOLD / KXXRPD / "
+                        "KXDOGED / KXHYPED / KXBNBD are all 1-2ct deep — "
+                        "use observer instead of live trader for those.")
     p.add_argument("--align-mode", default="5tier_v13b_1to3_flat",
                    choices=["disabled", "2tier", "3tier", "5tier",
                             "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4",
@@ -163,10 +191,7 @@ async def _discover_1hr_markets(
             continue
         for m in markets:
             ticker = m.get("ticker")
-            try:
-                strike = float(m.get("floor_strike") or 0)
-            except (TypeError, ValueError):
-                continue
+            strike = _strike_from_market(m)
             open_ms = _iso_to_ms(m.get("open_time"))
             close_ms = _iso_to_ms(m.get("close_time"))
             if not ticker or strike <= 0 or open_ms is None or close_ms is None:
@@ -210,10 +235,7 @@ async def _discovery_loop(
                     ticker = m.get("ticker")
                     if not ticker or ticker in strategy.markets:
                         continue
-                    try:
-                        strike = float(m.get("floor_strike") or 0)
-                    except (TypeError, ValueError):
-                        continue
+                    strike = _strike_from_market(m)
                     open_ms = _iso_to_ms(m.get("open_time"))
                     close_ms = _iso_to_ms(m.get("close_time"))
                     if strike <= 0 or open_ms is None or close_ms is None:
