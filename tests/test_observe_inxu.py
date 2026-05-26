@@ -1,0 +1,205 @@
+"""Smoke tests for observe_inxu — envelope emission + window dedup.
+
+Covers the InxuObserverState logic directly without spinning up the
+Kalshi WS or async Alpaca client. The integration paths (real WS, real
+Alpaca) are covered by the underlying components' tests.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from kalshi_engine.core.equity import Equity, SPECS
+from kalshi_engine.core.events import BookEvent
+from kalshi_engine.feeds.alpaca_spot import EquityTrade
+
+
+# ---- imports of internal helpers ----------------------------------------
+
+from kalshi_engine.bin.observe_inxu import (
+    _InxuObserverState, _handle_book, _strike_from_market,
+)
+
+
+def _make_book(ticker: str, recv_ms: int) -> BookEvent:
+    return BookEvent(
+        ticker=ticker, ts_ms=recv_ms, recv_ms=recv_ms,
+        yes_bid=480, yes_ask=520, no_bid=480, no_ask=520,
+        yes_levels=((500, 100.0),), no_levels=((500, 100.0),),
+    )
+
+
+def _make_log():
+    log = MagicMock()
+    log.writes = []
+    def _write(p): log.writes.append(p)
+    log.write = _write
+    return log
+
+
+def _fresh_state(observe_minutes=(30, 40, 50)):
+    state = _InxuObserverState(observe_minutes=observe_minutes)
+    open_ms = 1_779_800_000_000
+    close_ms = open_ms + 60 * 60_000
+    state.register("KXINXU-CYC1-T6000", strike=6000.0, open_ms=open_ms,
+                    close_ms=close_ms, series="KXINXU", equity=Equity.SPX)
+    return state, open_ms
+
+
+# ---- window detection ----------------------------------------------------
+
+def test_window_label_at_t30():
+    state, _ = _fresh_state()
+    assert state.window_label(30.0) == "T+30"
+
+def test_window_label_at_t40():
+    state, _ = _fresh_state()
+    assert state.window_label(40.0) == "T+40"
+
+def test_window_label_at_t50():
+    state, _ = _fresh_state()
+    assert state.window_label(50.0) == "T+50"
+
+def test_window_label_misses_t45():
+    """Default observe minutes are 30/40/50 — T+45 must NOT match."""
+    state, _ = _fresh_state()
+    assert state.window_label(45.0) is None
+
+def test_window_label_tolerance_below_60s():
+    """Within 1 minute of a target counts as the window."""
+    state, _ = _fresh_state()
+    assert state.window_label(30.5) == "T+30"
+    assert state.window_label(29.5) == "T+30"
+
+def test_window_label_outside_tolerance_misses():
+    state, _ = _fresh_state()
+    assert state.window_label(31.5) is None
+    assert state.window_label(28.5) is None
+
+
+# ---- envelope emission --------------------------------------------------
+
+def test_handle_book_emits_envelope_at_t30():
+    state, open_ms = _fresh_state()
+    log = _make_log()
+    alpaca = AsyncMock()
+    alpaca.get_last_trade.return_value = EquityTrade(
+        symbol="SPY", price=502.34, ts_ms=open_ms + 30*60_000,
+        recv_ms=open_ms + 30*60_000, exchange="V",
+    )
+    ev = _make_book("KXINXU-CYC1-T6000", recv_ms=open_ms + 30*60_000)
+    asyncio.run(_handle_book(ev, state, alpaca, log))
+    env = [w for w in log.writes if w.get("kind") == "book_at_inxu_pretrigger"]
+    assert len(env) == 1
+    assert env[0]["window_label"] == "T+30"
+    assert env[0]["spot"] == 502.34
+    assert env[0]["alpaca_symbol"] == "SPY"
+    assert env[0]["equity"] == "SPX"
+
+
+def test_handle_book_dedup_one_envelope_per_window():
+    """Two book events within the same window emit only ONE envelope."""
+    state, open_ms = _fresh_state()
+    log = _make_log()
+    alpaca = AsyncMock()
+    alpaca.get_last_trade.return_value = EquityTrade(
+        symbol="SPY", price=500.0, ts_ms=0, recv_ms=0, exchange="V")
+    ev1 = _make_book("KXINXU-CYC1-T6000", recv_ms=open_ms + 30*60_000)
+    ev2 = _make_book("KXINXU-CYC1-T6000", recv_ms=open_ms + int(30.3 * 60_000))
+    asyncio.run(_handle_book(ev1, state, alpaca, log))
+    asyncio.run(_handle_book(ev2, state, alpaca, log))
+    env = [w for w in log.writes if w.get("kind") == "book_at_inxu_pretrigger"]
+    assert len(env) == 1
+
+
+def test_handle_book_separate_windows_emit_separately():
+    """T+30 and T+40 on the same ticker each emit once."""
+    state, open_ms = _fresh_state()
+    log = _make_log()
+    alpaca = AsyncMock()
+    alpaca.get_last_trade.return_value = EquityTrade(
+        symbol="SPY", price=500.0, ts_ms=0, recv_ms=0, exchange="V")
+    ev30 = _make_book("KXINXU-CYC1-T6000", recv_ms=open_ms + 30*60_000)
+    ev40 = _make_book("KXINXU-CYC1-T6000", recv_ms=open_ms + 40*60_000)
+    asyncio.run(_handle_book(ev30, state, alpaca, log))
+    asyncio.run(_handle_book(ev40, state, alpaca, log))
+    env = [w for w in log.writes if w.get("kind") == "book_at_inxu_pretrigger"]
+    assert len(env) == 2
+    assert {e["window_label"] for e in env} == {"T+30", "T+40"}
+
+
+def test_handle_book_ignores_unknown_ticker():
+    state, open_ms = _fresh_state()
+    log = _make_log()
+    alpaca = AsyncMock()
+    ev = _make_book("KXINXU-OTHER-T7000", recv_ms=open_ms + 30*60_000)
+    asyncio.run(_handle_book(ev, state, alpaca, log))
+    assert not log.writes
+    alpaca.get_last_trade.assert_not_called()
+
+
+def test_handle_book_outside_window_no_envelope():
+    state, open_ms = _fresh_state()
+    log = _make_log()
+    alpaca = AsyncMock()
+    ev = _make_book("KXINXU-CYC1-T6000", recv_ms=open_ms + 10*60_000)
+    asyncio.run(_handle_book(ev, state, alpaca, log))
+    assert not log.writes
+    alpaca.get_last_trade.assert_not_called()
+
+
+def test_handle_book_alpaca_returns_none_logs_skip():
+    """When Alpaca returns None (market closed / poll failed), log
+    spot_poll_skip and mark window fired so we don't retry endlessly."""
+    state, open_ms = _fresh_state()
+    log = _make_log()
+    alpaca = AsyncMock()
+    alpaca.get_last_trade.return_value = None
+    ev = _make_book("KXINXU-CYC1-T6000", recv_ms=open_ms + 30*60_000)
+    asyncio.run(_handle_book(ev, state, alpaca, log))
+    skips = [w for w in log.writes if w.get("kind") == "spot_poll_skip"]
+    assert len(skips) == 1
+    assert skips[0]["window_label"] == "T+30"
+    # Subsequent event in same window must not re-poll
+    ev2 = _make_book("KXINXU-CYC1-T6000", recv_ms=open_ms + int(30.3*60_000))
+    asyncio.run(_handle_book(ev2, state, alpaca, log))
+    assert alpaca.get_last_trade.call_count == 1
+
+
+# ---- strike parse -------------------------------------------------------
+
+def test_strike_from_market_floor_strike():
+    assert _strike_from_market({"floor_strike": 5500.0, "ticker": "X"}) == 5500.0
+
+def test_strike_from_market_ticker_fallback():
+    m = {"floor_strike": None, "ticker": "KXINXU-26MAY26H1100-T5499.9999"}
+    assert _strike_from_market(m) == 5499.9999
+
+def test_strike_from_market_returns_zero_on_bad():
+    assert _strike_from_market({"ticker": "no-strike-here"}) == 0.0
+
+
+# ---- registration -------------------------------------------------------
+
+def test_register_market_persists_metadata():
+    state, _ = _fresh_state()
+    m = state.markets["KXINXU-CYC1-T6000"]
+    assert m["strike"] == 6000.0
+    assert m["series"] == "KXINXU"
+    assert m["equity"] == Equity.SPX
+
+
+# ---- spec lookup --------------------------------------------------------
+
+def test_spec_lookup_for_spx():
+    spec = SPECS[Equity.SPX]
+    assert spec.kalshi_series == "KXINXU"
+    assert spec.alpaca_symbol == "SPY"
+
+def test_spec_lookup_for_ndx():
+    spec = SPECS[Equity.NDX]
+    assert spec.kalshi_series == "KXNASDAQ100U"
+    assert spec.alpaca_symbol == "QQQ"
