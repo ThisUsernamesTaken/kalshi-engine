@@ -66,7 +66,7 @@ def _evaluate(model, state, strike):
 )
 def test_eight_corners(model, vol_skip, bbdiv_skip, bps_skip):
     state = FakeState(
-        vol_pct=0.80 if vol_skip else 0.55,    # 0.80 > 0.67 skip; 0.55 neither
+        vol_pct=0.90 if vol_skip else 0.55,    # 0.90 > 0.80 skip; 0.55 neither
         bb_div=0.15 if bbdiv_skip else 0.0,    # 0.15 > 0.09 skip; 0.0 neither
     )
     strike = _STRIKE_NEAR if bps_skip else _STRIKE_FAR
@@ -99,3 +99,29 @@ def test_diagnostics_complete(model):
     for key in ("vol_30m", "vol_30m_pct", "bb_div", "bps_margin",
                 "bps_threshold", "bb_yes", "spot", "strike"):
         assert key in diag
+
+
+def test_phase_14_10_v1_vol_pct_cap_at_080():
+    """Phase 14.10 — v1 cutpoints raise vol_30m_percentile_skip_above 0.67 -> 0.80.
+
+    Loaded explicitly because the 15m engine launches with --cutpoints-version v1.
+    Loosened based on full-universe sweep showing ETH/SOL/DOGE significant
+    positive Δ at 95% CI. See
+    C:/Trading/_tmp_analysis/full_universe_sweep_15m/HONEST_VERDICT.md.
+    """
+    v1_path = MODELS_DIR / "phase4_cutpoints" / "v1" / "cutpoints.json"
+    if not v1_path.exists():
+        pytest.skip(f"v1 cutpoints not present: {v1_path}")
+    m = Phase4CutpointsModel(cutpoints_path=str(v1_path))
+    # Cap itself
+    assert m.vol_skip_above == 0.80
+    # Just below cap → ENTER (assuming other gates pass)
+    just_below = _evaluate(m, FakeState(vol_pct=0.79), _STRIKE_FAR)
+    assert just_below.action is Action.ENTER, just_below.reason
+    # Just above cap → SKIP
+    just_above = _evaluate(m, FakeState(vol_pct=0.81), _STRIKE_FAR)
+    assert just_above.action is Action.SKIP
+    assert "vol_pct" in just_above.reason
+    # 0.67 (the prior cap) → ENTER under the new loosened gate
+    prior_cap = _evaluate(m, FakeState(vol_pct=0.67), _STRIKE_FAR)
+    assert prior_cap.action is Action.ENTER, prior_cap.reason
