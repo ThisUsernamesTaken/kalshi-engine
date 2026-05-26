@@ -263,20 +263,57 @@ async def _amain(args: argparse.Namespace) -> int:
             tickers = list(state.markets.keys())
             kalshi_ws = KalshiWebSocketFeed(client, tickers)
             _diag("entering run loop")
-            deadline = time.time() + args.duration_s if args.duration_s > 0 else None
-            async for ev in kalshi_ws.events():
-                if deadline and time.time() >= deadline:
-                    break
-                # Only book events drive observation
-                if getattr(ev, "yes_bid", None) is None:
-                    continue
-                try:
-                    await _handle_book(ev, state, alpaca, log)
-                except Exception as exc:
-                    log.write({"kind": "observe_error",
-                               "ticker": getattr(ev, "ticker", "?"),
-                               "error": repr(exc)})
+            await _run_loop(kalshi_ws, state, alpaca, log, args.duration_s)
     return 0
+
+
+async def _run_loop(kalshi_ws, state, alpaca, log, duration_s: float) -> None:
+    """Pump Kalshi WS into a queue and dispatch with a wait_for-bounded get.
+
+    Keeps the --duration-s deadline enforceable even when no WS events
+    arrive — equity markets can go minutes without a book update, and a
+    `async for ev in ws.events()` loop without timeout will block past the
+    deadline. Mirrors the pattern in observe_1hr._run_loop.
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    deadline = (time.time() + duration_s) if duration_s > 0 else None
+
+    async def pump():
+        try:
+            async for ev in kalshi_ws.events():
+                await queue.put(ev)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            log.write({"kind": "feed_error", "source": "kalshi",
+                       "error": repr(exc)})
+
+    pump_task = asyncio.create_task(pump())
+    try:
+        while True:
+            if deadline is not None and time.time() >= deadline:
+                break
+            remaining = max(0.1, deadline - time.time()) if deadline else 5.0
+            try:
+                ev = await asyncio.wait_for(queue.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                continue
+            if getattr(ev, "yes_bid", None) is None:
+                continue
+            try:
+                await _handle_book(ev, state, alpaca, log)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.write({"kind": "observe_error",
+                           "ticker": getattr(ev, "ticker", "?"),
+                           "error": repr(exc)})
+    finally:
+        pump_task.cancel()
+        try:
+            await pump_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 def main(argv=None) -> int:

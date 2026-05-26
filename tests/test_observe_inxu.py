@@ -20,7 +20,7 @@ from kalshi_engine.feeds.alpaca_spot import EquityTrade
 # ---- imports of internal helpers ----------------------------------------
 
 from kalshi_engine.bin.observe_inxu import (
-    _InxuObserverState, _handle_book, _strike_from_market,
+    _InxuObserverState, _handle_book, _strike_from_market, _run_loop,
 )
 
 
@@ -203,3 +203,60 @@ def test_spec_lookup_for_ndx():
     spec = SPECS[Equity.NDX]
     assert spec.kalshi_series == "KXNASDAQ100U"
     assert spec.alpaca_symbol == "QQQ"
+
+
+# ---- run_loop deadline enforcement ---------------------------------------
+
+class _SilentWs:
+    """WS stub whose events() yields nothing, simulating a quiet equity
+    market with no book updates inside the duration window."""
+    async def events(self):
+        # Block indefinitely. The deadline must override this.
+        await asyncio.Event().wait()
+        if False:
+            yield None  # pragma: no cover — satisfies async-iter contract
+
+def test_run_loop_honors_deadline_when_no_events_arrive():
+    """Regression: an earlier version of the loop used `async for ev in
+    ws.events()` and only checked the deadline on each event. With a quiet
+    feed the loop blocked past --duration-s. The fix uses asyncio.wait_for
+    around a queue.get(), so the deadline fires deterministically."""
+    state, _ = _fresh_state()
+    log = _make_log()
+    alpaca = AsyncMock()
+    ws = _SilentWs()
+    import time as _time
+    start = _time.time()
+    asyncio.run(_run_loop(ws, state, alpaca, log, duration_s=0.5))
+    elapsed = _time.time() - start
+    # Should exit within ~1.5s (0.5s deadline + cleanup slack). The pre-fix
+    # version blocked indefinitely.
+    assert elapsed < 1.5, f"run_loop overshot deadline: {elapsed:.2f}s"
+    # No envelopes emitted (no events arrived)
+    assert not [w for w in log.writes if w.get("kind") == "book_at_inxu_pretrigger"]
+
+
+class _OneEventWs:
+    """WS that yields one book event then stalls. Used to verify the
+    handler still fires when an event DOES arrive before the deadline."""
+    def __init__(self, ev):
+        self._ev = ev
+    async def events(self):
+        yield self._ev
+        await asyncio.Event().wait()  # then stall
+
+def test_run_loop_dispatches_event_then_honors_deadline():
+    state, open_ms = _fresh_state()
+    log = _make_log()
+    alpaca = AsyncMock()
+    alpaca.get_last_trade.return_value = EquityTrade(
+        symbol="SPY", price=500.0, ts_ms=0, recv_ms=0, exchange="V")
+    ev = _make_book("KXINXU-CYC1-T6000", recv_ms=open_ms + 30*60_000)
+    ws = _OneEventWs(ev)
+    import time as _time
+    start = _time.time()
+    asyncio.run(_run_loop(ws, state, alpaca, log, duration_s=0.5))
+    elapsed = _time.time() - start
+    assert elapsed < 1.5
+    env = [w for w in log.writes if w.get("kind") == "book_at_inxu_pretrigger"]
+    assert len(env) == 1
