@@ -116,7 +116,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--align-mode", default="5tier_v13b_1to3_flat",
                    choices=["disabled", "2tier", "3tier", "5tier",
                             "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4",
-                            "5tier_v13b_1to3_flat"],
+                            "5tier_v13b_1to3_flat", "5tier_v13b_10_flat",
+                            "5tier_v13b_7_10_10"],
                    help="Phase-13.1 default: 5tier_v13b_1to3_flat — same V13b "
                         "score formula, skip<4, flat 3ct otherwise. The T3 "
                         "winner from the 1hr observer tier sweep scaled to "

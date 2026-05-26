@@ -151,9 +151,37 @@ H1H4_SCORE_MULT = 1.8
 H1TO3_FLAT_SKIP_BELOW = 4.0
 H1TO3_FLAT_SIZE = 3
 
+# Phase 13.2 (V13b 10-flat) — scaled-up sizing variant of 1to3_flat for the
+# 1hr live engine. Same V13b score formula and hard gates. SKIPs <4, sizes
+# ALL passing trades at flat 10 contracts. The T3 ("all-in >=4") winner
+# from the 1hr observer tier sweep at FULL 10ct size. Worst single-trade
+# loss ~$9.20 (10ct * $0.92) — ~92% of the $10/day cap, so the cap binds
+# after a single max-tier loss. Use only when book depth supports 10ct
+# fills (KXBTCD 463ct + KXETHD 217ct near 50c both qualify; SOL/XRP/DOGE/
+# HYPE/BNB do not).
+TEN_FLAT_SKIP_BELOW = 4.0
+TEN_FLAT_SIZE = 10
+
+# Phase 13.2 (V13b T6 7/10/10) — risk-balanced scale-up for the 1hr live
+# engine. Same V13b score formula and hard gates. SKIPs <4, sizes by tier:
+#     score < 4.0        -> SKIP
+#     4.0 <= score < 5.0 -> 7 ct
+#     5.0 <= score < 6.0 -> 10 ct
+#     score >= 6.0       -> 10 ct
+# The T6 ("asymmetric 7/10/10") variant from the 1hr observer tier sweep
+# captures 95% of the T3 (all-flat-10ct) PnL while capping the marginal
+# score=4 tier at 7ct — meaningful tail-risk reduction (-$4.90 worst-
+# trade vs -$7.00 for T3 in the sweep). Worst single-trade loss is
+# bounded at 10ct * $0.92 = ~$9.20.
+T6_SKIP_BELOW = 4.0
+T6_SIZE_AT_4 = 7
+T6_SIZE_AT_5 = 10
+T6_SIZE_AT_6 = 10
+
 ALIGN_MODES = ("disabled", "2tier", "3tier", "5tier",
                "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4",
-               "5tier_v13b_1to3_flat")
+               "5tier_v13b_1to3_flat", "5tier_v13b_10_flat",
+               "5tier_v13b_7_10_10")
 
 
 class Phase4CutpointsModel:
@@ -493,6 +521,91 @@ class Phase4CutpointsModel:
                 ticker=ticker, action=Action.ENTER, side=side, size=size,
                 confidence=conf,
                 reason=(f"5TIER_V13B_H1H4 score={score:.1f} -> {size}ct "
+                        f"(div_band={bb_div_band} side_no={side_no} "
+                        f"bps_strong={bps_strong} super_band={super_band})"),
+                diagnostics=diag)
+
+        if self.align_mode == "5tier_v13b_7_10_10":
+            # Phase 13.2 — V13b T6 asymmetric (7/10/10) for 1hr live scale-up.
+            # Same V13b score + hard gates. SKIPs <4, then 7/10/10 by tier.
+            if s_bps == 0:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_7_10_10 skip: s_bps=0 (bps_margin {bps_margin:.2f} <= "
+                    f"{ALIGN_BPS_MULT}*{threshold:.2f})", diag)
+            bb_div_band = 1 if (DEEP_DIV_SKIP < bb_div <= DIV_BAND_UPPER) else 0
+            side_no = 1 if side is Side.NO else 0
+            side_yes = 1 - side_no
+            bps_strong = 1 if bps_margin > BPS_STRONG_MULT * threshold else 0
+            super_band = 1 if (SUPER_BAND_LOW < bb_div <= SUPER_BAND_HIGH) else 0
+            score = (2.0 * bb_div_band + 1.5 * side_no
+                     + 2.0 * bps_strong + 1.0 * super_band)
+            diag.update({
+                "bb_div_band": bb_div_band,
+                "bps_strong": bps_strong,
+                "side_yes": side_yes,
+                "side_no": side_no,
+                "super_band": super_band,
+                "score_5tier_v13b_7_10_10": score,
+            })
+            if score < T6_SKIP_BELOW:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_7_10_10 skip: score={score:.1f} < "
+                    f"{T6_SKIP_BELOW} (div_band={bb_div_band} "
+                    f"side_no={side_no} bps_strong={bps_strong} "
+                    f"super_band={super_band})", diag)
+            if score < 5.0:
+                size = T6_SIZE_AT_4
+            elif score < 6.0:
+                size = T6_SIZE_AT_5
+            else:
+                size = T6_SIZE_AT_6
+            conf = min(1.0, score / 6.5)
+            return Decision(
+                ticker=ticker, action=Action.ENTER, side=side, size=size,
+                confidence=conf,
+                reason=(f"5TIER_V13B_7_10_10 score={score:.1f} -> {size}ct "
+                        f"(div_band={bb_div_band} side_no={side_no} "
+                        f"bps_strong={bps_strong} super_band={super_band})"),
+                diagnostics=diag)
+
+        if self.align_mode == "5tier_v13b_10_flat":
+            # Phase 13.2 — V13b flat-10ct sizing for 1hr scale-up.
+            # Same V13b score + hard gates. SKIPs <4, sizes ALL passing at 10.
+            if s_bps == 0:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_10_FLAT skip: s_bps=0 (bps_margin {bps_margin:.2f} <= "
+                    f"{ALIGN_BPS_MULT}*{threshold:.2f})", diag)
+            bb_div_band = 1 if (DEEP_DIV_SKIP < bb_div <= DIV_BAND_UPPER) else 0
+            side_no = 1 if side is Side.NO else 0
+            side_yes = 1 - side_no
+            bps_strong = 1 if bps_margin > BPS_STRONG_MULT * threshold else 0
+            super_band = 1 if (SUPER_BAND_LOW < bb_div <= SUPER_BAND_HIGH) else 0
+            score = (2.0 * bb_div_band + 1.5 * side_no
+                     + 2.0 * bps_strong + 1.0 * super_band)
+            diag.update({
+                "bb_div_band": bb_div_band,
+                "bps_strong": bps_strong,
+                "side_yes": side_yes,
+                "side_no": side_no,
+                "super_band": super_band,
+                "score_5tier_v13b_10_flat": score,
+            })
+            if score < TEN_FLAT_SKIP_BELOW:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_10_FLAT skip: score={score:.1f} < "
+                    f"{TEN_FLAT_SKIP_BELOW} (div_band={bb_div_band} "
+                    f"side_no={side_no} bps_strong={bps_strong} "
+                    f"super_band={super_band})", diag)
+            size = TEN_FLAT_SIZE
+            conf = min(1.0, score / 6.5)
+            return Decision(
+                ticker=ticker, action=Action.ENTER, side=side, size=size,
+                confidence=conf,
+                reason=(f"5TIER_V13B_10_FLAT score={score:.1f} -> {size}ct "
                         f"(div_band={bb_div_band} side_no={side_no} "
                         f"bps_strong={bps_strong} super_band={super_band})"),
                 diagnostics=diag)
