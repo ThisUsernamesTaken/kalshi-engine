@@ -111,20 +111,26 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "KXSOLD / KXXRPD / KXDOGED / KXHYPED / KXBNBD are "
                         "all 1-2ct deep — use observer instead of live "
                         "trader for those.")
-    p.add_argument("--align-mode", default="5tier_v13b_1to3_flat",
+    p.add_argument("--align-mode", default="5tier_v13b_7_10_10",
                    choices=["disabled", "2tier", "3tier", "5tier",
                             "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4",
                             "5tier_v13b_1to3_flat", "5tier_v13b_10_flat",
                             "5tier_v13b_7_10_10"],
-                   help="Phase-13.1 default: 5tier_v13b_1to3_flat — same V13b "
-                        "score formula, skip<4, flat 3ct otherwise. The T3 "
-                        "winner from the 1hr observer tier sweep scaled to "
-                        "1-3ct ceiling for the unproven 1hr regime.")
-    p.add_argument("--max-contracts", type=int, default=3,
-                   help="Hard ceiling on contracts per trade. Default 3 — the "
-                        "HourglassTraderStrategy will clip any larger decision "
-                        "to this value (defense-in-depth above the align-mode "
-                        "logic). Worst single-trade loss at 3ct * 92c = $2.76.")
+                   help="Phase-13.2 default: 5tier_v13b_7_10_10 (T6) — same "
+                        "V13b score formula, skip<4, then 7ct (score 4-5) / "
+                        "10ct (score 5-6) / 10ct (>=6). T6 asymmetric variant "
+                        "from the 1hr observer tier sweep: captures 95%% of "
+                        "T3's all-flat-10 PnL with -$4.90 worst trade vs "
+                        "-$7.00 for T3. Earlier conservative variants "
+                        "(5tier_v13b_1to3_flat) remain selectable.")
+    p.add_argument("--max-contracts", type=int, default=10,
+                   help="Hard ceiling on contracts per trade. Default 10 — "
+                        "matches the T6 sizing schedule's max tier. The "
+                        "HourglassTraderStrategy clips any larger decision "
+                        "to this value (defense-in-depth above align-mode). "
+                        "Worst single-trade loss at 10ct * 92c = $9.20 "
+                        "(~92%% of $10/day cap — cap binds after one max-tier "
+                        "loss).")
     p.add_argument("--daily-cap-cents", type=int, default=1000,
                    help="Daily realized-loss cap in cents. Default 1000 ($10). "
                         "Independent from the 15m engine's separate $10 cap.")

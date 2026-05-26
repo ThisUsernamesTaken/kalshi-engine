@@ -118,6 +118,40 @@ log under `$KALSHI_ENGINE_WAREHOUSE/raw/live_logs/`. After that, every
 decision, fill, settlement and book event is appended as one JSON line per
 event.
 
+### 1-hour live engine (current production T6 config)
+
+Trades the KX{C}D 1-hour digital markets. Runs alongside the 15m engine
+as a separate process with its own $10/day risk envelope. Universe is
+BTC + ETH only — the other 5 active 1hr crypto series on Kalshi all have
+1-2ct book depth at extreme strikes (vs KXBTCD 463ct / KXETHD 217ct
+near 50¢), too thin for reliable 7-10ct fills.
+
+```bash
+python -m kalshi_engine.bin.live_1hr \
+    --strategy favorite_chase \
+    --model phase4_cutpoints \
+    --cutpoints-version v1 \
+    --align-mode 5tier_v13b_7_10_10 \
+    --max-contracts 10 \
+    --reentry-mode disabled \
+    --trigger-minutes 30,50 \
+    --skip-hours 13 \
+    --max-favorite-cost-decicents 920 \
+    --cryptos BTC,ETH \
+    --spot-source bitstamp \
+    --stop-mode none \
+    --bps-gate enabled \
+    --daily-cap-cents 1000
+```
+
+`--align-mode 5tier_v13b_7_10_10` (T6) is the current production sizing
+for the 1hr engine: same V13b score formula, then `skip<4, 7ct[4,5),
+10ct[5,6), 10ct>=6`. Earlier conservative variant `5tier_v13b_1to3_flat`
+(flat 3ct on score>=4) is preserved as a selectable option for lower
+exposure. `--trigger-minutes 30,50` and `--skip-hours 13` come from the
+1hr observer tier sweep — T+45 was actively losing and 13Z was -$84/16
+trades.
+
 ### 1-hour observer (Phase 13.0 — read-only)
 
 ```bash

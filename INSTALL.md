@@ -389,6 +389,51 @@ Expected:
   `{"kind":"decision",...}` and (when entries fire) `{"kind":"order_intent"}`
   + `{"kind":"order_filled"}` lines in the JSONL log.
 
+### 10b. 1-hour live engine (current production T6 config)
+
+The 1hr engine trades the KX{C}D digital markets (BTC + ETH only — the
+other 1hr crypto series have insufficient book depth at extreme strikes
+for reliable 7-10ct fills). Runs alongside the 15m engine, separate
+process, separate $10/day risk envelope, separate log file.
+
+STOP — real orders. Worst single-trade loss is ~$9.20 (10ct * 92c).
+Daily cap binds after one max-tier loss.
+
+```bash
+python -m kalshi_engine.bin.live_1hr \
+    --strategy favorite_chase \
+    --model phase4_cutpoints \
+    --cutpoints-version v1 \
+    --align-mode 5tier_v13b_7_10_10 \
+    --max-contracts 10 \
+    --reentry-mode disabled \
+    --trigger-minutes 30,50 \
+    --skip-hours 13 \
+    --max-favorite-cost-decicents 920 \
+    --cryptos BTC,ETH \
+    --spot-source bitstamp \
+    --stop-mode none \
+    --bps-gate enabled \
+    --daily-cap-cents 1000
+```
+
+Notes:
+- `--align-mode 5tier_v13b_7_10_10` (T6): same V13b score formula as
+  the 15m engine, but the sizing schedule is `skip<4, 7ct@score[4,5),
+  10ct@score[5,6), 10ct@score>=6`. From the 1hr observer tier sweep:
+  95% of T3's PnL with a tighter score-4 tail (-$4.90 vs -$7.00 worst
+  trade).
+- `--trigger-minutes 30,50`: 1hr cycles get evaluated at T+30 and T+50
+  (mins into the hour). T+45 is intentionally skipped (was -$5.79 in
+  the sweep).
+- `--skip-hours 13`: UTC 13Z blocked (37.5% WR / -$84.17 in the sweep).
+- `--max-favorite-cost-decicents 920`: hard cap on entry-side cost at
+  92¢ — protects against the Kalshi fee trap that eats edge above 95¢.
+  In live this filters ~98% of decisions because 1hr favorites tend to
+  pin near 99¢ before T+50.
+
+All other flags are 15m-shared and behave identically.
+
 ---
 
 ## 11. Monitor
