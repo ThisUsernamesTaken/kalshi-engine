@@ -77,6 +77,7 @@ class HourglassTraderStrategy:
         skip_hours_utc: tuple[int, ...] = (13,),
         max_favorite_cost_decicents: int = 920,
         max_contracts: int = 3,
+        per_crypto_max_contracts: dict[str, int] | None = None,
     ) -> None:
         if log_writer is None:
             raise ValueError("HourglassTraderStrategy requires a log_writer")
@@ -90,6 +91,20 @@ class HourglassTraderStrategy:
         self.skip_hours_utc = frozenset(int(h) for h in skip_hours_utc)
         self.max_favorite_cost_decicents = int(max_favorite_cost_decicents)
         self.max_contracts = int(max_contracts)
+        # Phase 13.6 — per-crypto sizing overrides. Values clip BEFORE the
+        # global max_contracts ceiling. Missing crypto => use global cap.
+        # Example: {"ETH": 1} caps ETH at 1ct while leaving BTC/SOL/etc. at
+        # whatever the align_mode returns (subject to max_contracts).
+        if per_crypto_max_contracts is None:
+            self.per_crypto_max_contracts: dict[str, int] = {}
+        else:
+            self.per_crypto_max_contracts = {
+                str(k).upper(): int(v) for k, v in per_crypto_max_contracts.items()
+            }
+        for k, v in self.per_crypto_max_contracts.items():
+            if v < 1:
+                raise ValueError(
+                    f"per_crypto_max_contracts[{k}]={v} must be >= 1")
         self.markets: dict[str, HourMarketMeta] = {}
         # Per-crypto rolling state (spot/vol/bb_div). Shared FavoriteChaseState
         # implementation since the math is identical for 1hr cycles — the only
@@ -232,6 +247,11 @@ class HourglassTraderStrategy:
             close_ms=meta.close_ms,
         )
 
+        # Per-crypto cap (Phase 13.6) applied BEFORE the global ceiling.
+        if decision.action == Action.ENTER:
+            per_cap = self.per_crypto_max_contracts.get(crypto.upper())
+            if per_cap is not None and decision.size > per_cap:
+                decision = replace(decision, size=per_cap)
         # Defense-in-depth: clip any ENTER to the max_contracts ceiling even
         # if a future align-mode somehow returned a larger size. The
         # 5tier_v13b_1to3_flat default never returns >3 so this is normally

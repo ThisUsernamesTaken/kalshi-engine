@@ -131,6 +131,14 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "Worst single-trade loss at 10ct * 92c = $9.20 "
                         "(~92%% of $10/day cap — cap binds after one max-tier "
                         "loss).")
+    p.add_argument("--per-crypto-max-contracts", default="",
+                   help="Phase 13.6 — per-crypto sizing override. Format: "
+                        "'BTC=10,ETH=1'. Each entry caps that crypto's per-trade "
+                        "size BEFORE the global --max-contracts ceiling. Empty "
+                        "string (default) disables the override and falls back "
+                        "to --max-contracts uniformly. Use for asset-class-tier "
+                        "risk reduction (e.g. ETH at 1ct while BTC stays at 10ct "
+                        "while ETH-specific gates are being calibrated).")
     p.add_argument("--daily-cap-cents", type=int, default=1000,
                    help="Daily realized-loss cap in cents. Default 1000 ($10). "
                         "Independent from the 15m engine's separate $10 cap.")
@@ -471,6 +479,16 @@ async def _amain(args: argparse.Namespace) -> int:
         align_mode=args.align_mode,
         time_of_day_skip=False,  # we use our own --skip-hours mechanism
     )
+    per_crypto_caps: dict[str, int] = {}
+    if args.per_crypto_max_contracts.strip():
+        try:
+            for pair in args.per_crypto_max_contracts.split(","):
+                k, v = pair.strip().split("=", 1)
+                per_crypto_caps[k.strip().upper()] = int(v.strip())
+        except (ValueError, IndexError) as exc:
+            print(f"ERROR: invalid --per-crypto-max-contracts "
+                  f"{args.per_crypto_max_contracts!r}: {exc}", file=sys.stderr)
+            return 2
     strategy = HourglassTraderStrategy(
         log_writer=log,
         model=model,
@@ -478,6 +496,7 @@ async def _amain(args: argparse.Namespace) -> int:
         skip_hours_utc=skip_hours,
         max_favorite_cost_decicents=args.max_favorite_cost_decicents,
         max_contracts=args.max_contracts,
+        per_crypto_max_contracts=per_crypto_caps or None,
     )
     envelope = RiskEnvelope(
         daily_loss_cap_cents=args.daily_cap_cents,
@@ -536,6 +555,7 @@ async def _amain(args: argparse.Namespace) -> int:
             "skip_hours_utc": list(skip_hours),
             "max_favorite_cost_decicents": args.max_favorite_cost_decicents,
             "max_contracts": args.max_contracts,
+            "per_crypto_max_contracts": per_crypto_caps,
             "daily_cap_cents": args.daily_cap_cents,
             "spot_source": args.spot_source,
             "stop_mode": args.stop_mode,
