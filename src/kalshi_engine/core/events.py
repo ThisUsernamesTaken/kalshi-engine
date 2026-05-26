@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from kalshi_engine.core.equity import Equity
 from kalshi_engine.core.types import Crypto, Side, Venue
 
 
@@ -47,6 +48,20 @@ class SpotEvent:
     ts_ms: int
     recv_ms: int
     price: float  # underlying price in dollars (not deci-cents)
+
+
+@dataclass(frozen=True, slots=True)
+class EquitySpotEvent:
+    """A spot/index price print for one equity-index proxy (e.g. SPY for SPX,
+    QQQ for NDX). Mirrors SpotEvent but typed for the Equity universe so the
+    crypto and equity pipelines don't share an enum or accidentally cross-feed.
+    """
+
+    equity: Equity
+    symbol: str       # the Alpaca proxy ticker the price was polled for (SPY/QQQ)
+    ts_ms: int
+    recv_ms: int
+    price: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,5 +109,6 @@ class LifecycleEvent:
 MarketEvent = BookEvent | TradeEvent | SettlementEvent | LifecycleEvent
 """Events scoped to a specific Kalshi market (they carry a ``ticker``)."""
 
-Event = BookEvent | SpotEvent | TradeEvent | SettlementEvent | LifecycleEvent
+Event = (BookEvent | SpotEvent | EquitySpotEvent | TradeEvent
+         | SettlementEvent | LifecycleEvent)
 """Any event the engine ingests."""

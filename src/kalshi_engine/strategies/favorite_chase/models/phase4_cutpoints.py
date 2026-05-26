@@ -167,6 +167,20 @@ LOOSE_SIZE_BORDERLINE = 3
 H1TO3_FLAT_SKIP_BELOW = 4.0
 H1TO3_FLAT_SIZE = 3
 
+# Phase 14.0 (V13b EQUITY 1ct flat) — minimum-risk launch sizing for the
+# first live equity-index engine (KXINXU). Same V13b score formula + hard
+# gates as 5tier_v13b. SKIPs score<4 (H1 floor). All passing trades at a
+# flat 1 contract — tightest possible cap until equity-regime cutpoints
+# are recalibrated from observer data.
+#
+# Rationale: the model + cutpoints are crypto-calibrated. We do NOT yet
+# know if score>=4 carries the same WR in equities. 1ct caps single-trade
+# downside at $0.92 (MAX_FAV_COST=920). Combined with --daily-cap-cents=500,
+# the wallet exposure binds at ~5 losses. Promote to 3ct only after >=100
+# live equity trades show projected EV holding.
+EQUITY_1CT_FLAT_SKIP_BELOW = 4.0
+EQUITY_1CT_FLAT_SIZE = 1
+
 # Phase 13.2 (V13b 10-flat) — scaled-up sizing variant of 1to3_flat for the
 # 1hr live engine. Same V13b score formula and hard gates. SKIPs <4, sizes
 # ALL passing trades at flat 10 contracts. The T3 ("all-in >=4") winner
@@ -204,7 +218,8 @@ DOGE_BPS_FLOOR = 10.0
 ALIGN_MODES = ("disabled", "2tier", "3tier", "5tier",
                "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4",
                "5tier_v13b_1to3_flat", "5tier_v13b_10_flat",
-               "5tier_v13b_7_10_10", "5tier_v13b_h1h4_loose")
+               "5tier_v13b_7_10_10", "5tier_v13b_h1h4_loose",
+               "5tier_v13b_equity_1ct_flat")
 
 
 class Phase4CutpointsModel:
@@ -741,6 +756,50 @@ class Phase4CutpointsModel:
                 ticker=ticker, action=Action.ENTER, side=side, size=size,
                 confidence=conf,
                 reason=(f"5TIER_V13B_1TO3_FLAT score={score:.1f} -> {size}ct "
+                        f"(div_band={bb_div_band} side_no={side_no} "
+                        f"bps_strong={bps_strong} super_band={super_band})"),
+                diagnostics=diag)
+
+        if self.align_mode == "5tier_v13b_equity_1ct_flat":
+            # Phase 14.0 — minimum-risk launch sizing for the first live
+            # equity-index engine. Same V13b score + hard gates. SKIPs <4,
+            # sizes ALL passing trades at flat 1 contract. Worst per-trade
+            # loss ~$0.92 at MAX_FAV_COST=920; daily cap binds at ~5 losses.
+            # Cutpoints are crypto-calibrated — the boot envelope must warn.
+            if s_bps == 0:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_EQUITY_1CT_FLAT skip: s_bps=0 "
+                    f"(bps_margin {bps_margin:.2f} <= "
+                    f"{ALIGN_BPS_MULT}*{threshold:.2f})", diag)
+            bb_div_band = 1 if (DEEP_DIV_SKIP < bb_div <= DIV_BAND_UPPER) else 0
+            side_no = 1 if side is Side.NO else 0
+            side_yes = 1 - side_no
+            bps_strong = 1 if bps_margin > BPS_STRONG_MULT * threshold else 0
+            super_band = 1 if (SUPER_BAND_LOW < bb_div <= SUPER_BAND_HIGH) else 0
+            score = (2.0 * bb_div_band + 1.5 * side_no
+                     + 2.0 * bps_strong + 1.0 * super_band)
+            diag.update({
+                "bb_div_band": bb_div_band,
+                "bps_strong": bps_strong,
+                "side_yes": side_yes,
+                "side_no": side_no,
+                "super_band": super_band,
+                "score_5tier_v13b_equity_1ct_flat": score,
+            })
+            if score < EQUITY_1CT_FLAT_SKIP_BELOW:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_EQUITY_1CT_FLAT skip: score={score:.1f} < "
+                    f"{EQUITY_1CT_FLAT_SKIP_BELOW} (div_band={bb_div_band} "
+                    f"side_no={side_no} bps_strong={bps_strong} "
+                    f"super_band={super_band})", diag)
+            size = EQUITY_1CT_FLAT_SIZE
+            conf = min(1.0, score / 6.5)
+            return Decision(
+                ticker=ticker, action=Action.ENTER, side=side, size=size,
+                confidence=conf,
+                reason=(f"5TIER_V13B_EQUITY_1CT_FLAT score={score:.1f} -> {size}ct "
                         f"(div_band={bb_div_band} side_no={side_no} "
                         f"bps_strong={bps_strong} super_band={super_band})"),
                 diagnostics=diag)
