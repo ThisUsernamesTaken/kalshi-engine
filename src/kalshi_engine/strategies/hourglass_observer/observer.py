@@ -165,6 +165,19 @@ class HourglassObserverStrategy:
                 except (ValueError, ZeroDivisionError):
                     pass
             bps_margin = abs(spot - meta.strike) / meta.strike * 1e4
+        # Phase 13.3: top-of-book depth from the level ladders. Each
+        # `yes_levels` / `no_levels` entry is (price_decicents, size_contracts);
+        # the bid is the entry whose price matches `yes_bid`, the ask is
+        # the matching `yes_ask`. Best-effort lookup — None if not present.
+        def _size_at(levels, price):
+            for p, sz in levels:
+                if p == price:
+                    return float(sz)
+            return None
+        yes_bid_size = _size_at(book.yes_levels, book.yes_bid)
+        yes_ask_size = _size_at(book.yes_levels, book.yes_ask)
+        no_bid_size = _size_at(book.no_levels, book.no_bid)
+        no_ask_size = _size_at(book.no_levels, book.no_ask)
         self._log.write({
             "kind": "book_at_1hr_pretrigger",
             "ticker": book.ticker,
@@ -176,6 +189,10 @@ class HourglassObserverStrategy:
             "window_label": f"T+{window_min}",
             "yes_bid": book.yes_bid, "yes_ask": book.yes_ask,
             "no_bid": book.no_bid, "no_ask": book.no_ask,
+            "yes_bid_size_fp": yes_bid_size,
+            "yes_ask_size_fp": yes_ask_size,
+            "no_bid_size_fp": no_bid_size,
+            "no_ask_size_fp": no_ask_size,
             "spot": spot,
             "vol_30m": vol,
             "bb_div": bb_div,

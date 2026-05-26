@@ -116,6 +116,12 @@ class FavoriteChaseStrategy:
         self.pre_trigger_throttle_ms = int(pre_trigger_throttle_ms)
         # Per-ticker last pre-trigger sample timestamp.
         self._last_pre_trigger_ms: dict[str, int] = {}
+        # Phase 13.3 — post-trigger book observation. Mirrors pre-trigger
+        # but fires T+8 -> T+14.5, including for already-entered tickers
+        # (envelope carries is_entered so backtests can split cohorts).
+        # Enables cross-crypto post-T+8 gradient research without
+        # depending on the broken burnin spot capture.
+        self._last_post_trigger_ms: dict[str, int] = {}
 
     def register_market(
         self, ticker: str, strike: float, open_ms: int, close_ms: int
@@ -155,6 +161,11 @@ class FavoriteChaseStrategy:
         # Fires BEFORE the trigger-window gate so we capture book state in
         # the pre-window period for "could we trigger earlier?" research.
         self._maybe_pre_trigger_observation(book, meta, state)
+        # Phase 13.3: post-trigger observation (T+8 to T+14.5 window).
+        # Mirrors pre-trigger but extends across the post-trigger period
+        # for later-entry-timing research. Fires for entered tickers too
+        # (the envelope carries is_entered so cohorts can be split).
+        self._maybe_post_trigger_observation(book, meta, state)
         if not is_trigger_window(book.recv_ms, meta.open_ms):
             return None
         favorite = select_favorite(book)
@@ -234,6 +245,12 @@ class FavoriteChaseStrategy:
     _PRE_TRIGGER_OPEN_MS = 5 * 60_000
     _PRE_TRIGGER_CLOSE_MS = 8 * 60_000   # = TRIGGER_OPEN_MS
 
+    # Phase 13.3 — Post-trigger window: T+8 to T+14.5 of the 15-min cycle.
+    # Mirrors pre-trigger emit logic but does NOT skip on entered tickers
+    # (we want post-T+8 trajectory for both entered + skipped cycles).
+    _POST_TRIGGER_OPEN_MS = 8 * 60_000        # = TRIGGER_OPEN_MS
+    _POST_TRIGGER_CLOSE_MS = int(14.5 * 60_000)  # 870_000 ms = T+14.5
+
     def _maybe_pre_trigger_observation(
         self,
         book: BookEvent,
@@ -302,6 +319,72 @@ class FavoriteChaseStrategy:
             "favorite_mid_decicents": fav_mid,
         })
         self._last_pre_trigger_ms[book.ticker] = book.recv_ms
+
+    def _maybe_post_trigger_observation(
+        self,
+        book: BookEvent,
+        meta: MarketMeta,
+        state: FavoriteChaseState,
+    ) -> None:
+        """Phase 13.3: emit ``book_at_post_trigger`` envelope during T+8 to
+        T+14.5. Mirrors pre-trigger but does NOT skip on already-entered
+        tickers — backtests want post-T+8 trajectory for both entered and
+        skipped cohorts. Reuses the same throttle / gating attribute
+        ``pre_trigger_observation`` since the two windows are complements.
+        """
+        if not self.pre_trigger_observation or self._log is None:
+            return
+        elapsed = book.recv_ms - meta.open_ms
+        if not (self._POST_TRIGGER_OPEN_MS <= elapsed < self._POST_TRIGGER_CLOSE_MS):
+            return
+        last = self._last_post_trigger_ms.get(book.ticker)
+        if last is not None and book.recv_ms - last < self.pre_trigger_throttle_ms:
+            return
+        yes_mid = (book.yes_bid + book.yes_ask) / 2.0
+        no_mid = (book.no_bid + book.no_ask) / 2.0
+        if yes_mid >= no_mid:
+            fav_side, fav_mid = "yes", yes_mid
+        else:
+            fav_side, fav_mid = "no", no_mid
+        spot = state.latest_spot()
+        vol = state.vol_30m()
+        bb_div = None
+        bps_margin = None
+        if spot is not None and vol is not None:
+            sigma = vol / 1e4
+            tau = (meta.close_ms - book.recv_ms) / 60_000.0
+            if sigma > 0 and tau > 0 and meta.strike > 0:
+                try:
+                    from math import log
+                    from statistics import NormalDist
+                    bb_yes = NormalDist().cdf(
+                        log(spot / meta.strike) / (sigma * (tau ** 0.5))
+                    )
+                    bb_fav = bb_yes if fav_side == "yes" else 1.0 - bb_yes
+                    bb_div = float(fav_mid) / 1000.0 - bb_fav
+                except (ValueError, ZeroDivisionError):
+                    pass
+            if meta.strike > 0:
+                bps_margin = abs(spot - meta.strike) / meta.strike * 1e4
+        self._log.write({
+            "kind": "book_at_post_trigger",
+            "ticker": book.ticker,
+            "ts_ms": book.recv_ms,
+            "elapsed_min": elapsed / 60_000.0,
+            "tau_min": (meta.close_ms - book.recv_ms) / 60_000.0,
+            "yes_bid": book.yes_bid,
+            "yes_ask": book.yes_ask,
+            "no_bid": book.no_bid,
+            "no_ask": book.no_ask,
+            "spot": spot,
+            "vol_30m": vol,
+            "bb_div": bb_div,
+            "bps_margin": bps_margin,
+            "favorite_side": fav_side,
+            "favorite_mid_decicents": fav_mid,
+            "is_entered": book.ticker in self.entered,
+        })
+        self._last_post_trigger_ms[book.ticker] = book.recv_ms
 
     def _maybe_snapshot(
         self,

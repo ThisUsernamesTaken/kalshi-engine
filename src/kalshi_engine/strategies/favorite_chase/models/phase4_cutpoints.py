@@ -178,6 +178,13 @@ T6_SIZE_AT_4 = 7
 T6_SIZE_AT_5 = 10
 T6_SIZE_AT_6 = 10
 
+# Phase 13.3 — DOGE-specific minimum bps_margin. Calibrated to the loser
+# distribution from the DOGE post-mortem (n=67): every cheap-NO loser
+# clustered at bps in [8.5, 10), with a YES-side loser at bps=8.34.
+# Bumping the floor to 10.0 catches 5/7 historical losers and forfeits
+# 9 winners worth $1.93 — net +$4.49 backtest improvement.
+DOGE_BPS_FLOOR = 10.0
+
 ALIGN_MODES = ("disabled", "2tier", "3tier", "5tier",
                "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4",
                "5tier_v13b_1to3_flat", "5tier_v13b_10_flat",
@@ -307,6 +314,17 @@ class Phase4CutpointsModel:
             return self._skip(
                 ticker, side,
                 f"bps_margin {bps_margin:.2f} < threshold {threshold:.2f}", diag)
+        # Phase 13.3 — DOGE-specific bps floor. Post-mortem on 67 DOGE
+        # trades found a structural cheap-NO loss cluster at bps in
+        # [8.5, 10): 4 of 6 historical losses (legacy strategies) live
+        # there, the YES-side loser also fell at bps=8.34. Net +$4.49
+        # backtest improvement across cohorts. Applied symmetrically to
+        # both sides; cap doesn't trip non-DOGE cryptos.
+        if state.crypto == "DOGE" and bps_margin < DOGE_BPS_FLOOR:
+            return self._skip(
+                ticker, side,
+                f"DOGE bps_margin {bps_margin:.2f} < per-crypto floor "
+                f"{DOGE_BPS_FLOOR:.1f}", diag)
 
         # ---- sizing: depends on align_mode ----
         if self.align_mode == "2tier":
