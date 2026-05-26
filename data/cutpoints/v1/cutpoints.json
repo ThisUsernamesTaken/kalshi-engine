@@ -1,0 +1,20 @@
+{
+  "version": "phase4_v1",
+  "created_at": "2026-05-22T17:50:00Z",
+  "source": "Phase 4 expansion analysis on 218-trade BTC-real + alt-synthetic dataset",
+  "vol_30m_percentile_skip_above": 0.67,
+  "vol_30m_percentile_upsize_below": 0.50,
+  "bb_div_skip_above": 0.09,
+  "bb_div_upsize_below": -0.03,
+  "bps_thresholds": {
+    "BTC": 3.9491400035563857,
+    "ETH": 4.807712853473733,
+    "SOL": 6.491398896461665,
+    "XRP": 5.924170616113865,
+    "DOGE": 7.885053443139985
+  },
+  "vol_history_window_hours": 12.5,
+  "vol_window_minutes": 30,
+  "sigma_for_bb_fair_bps_per_min": "computed from vol_30m at evaluation time",
+  "notes": "bps_thresholds ported verbatim (proposed_threshold_bps) from kalshi_btc_gradient_engine/scripts/monitors/per_crypto_thresholds.json. ETH and SOL showed near-zero discrimination in the Phase 4 analysis - flagged for Phase 6 walk-forward recalibration; current values used as-is."
+}

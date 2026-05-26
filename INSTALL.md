@@ -231,6 +231,50 @@ mkdir -p "$KALSHI_ENGINE_WAREHOUSE/raw/live_logs"
 
 ---
 
+## 7.5. Install the Phase 4 cutpoints artefact
+
+The model loads gate thresholds from a JSON artefact at
+`$KALSHI_ENGINE_WAREHOUSE/models/phase4_cutpoints/<version>/cutpoints.json`.
+The repo bundles two versions under `data/cutpoints/`:
+
+- **v1** — original Phase-4 thresholds (used by the 1hr engine, `bin.live_1hr`)
+- **v3** — Phase 12.5 Rec 3 recalibration (used by the 15m engine, `bin.live`)
+
+Copy both into the warehouse on a fresh install.
+
+**Windows (PowerShell):**
+```powershell
+New-Item -ItemType Directory -Force `
+  -Path "$env:KALSHI_ENGINE_WAREHOUSE\models\phase4_cutpoints\v1",
+        "$env:KALSHI_ENGINE_WAREHOUSE\models\phase4_cutpoints\v3" | Out-Null
+Copy-Item data\cutpoints\v1\cutpoints.json `
+  "$env:KALSHI_ENGINE_WAREHOUSE\models\phase4_cutpoints\v1\cutpoints.json"
+Copy-Item data\cutpoints\v3\cutpoints.json `
+  "$env:KALSHI_ENGINE_WAREHOUSE\models\phase4_cutpoints\v3\cutpoints.json"
+```
+
+**POSIX:**
+```bash
+mkdir -p "$KALSHI_ENGINE_WAREHOUSE/models/phase4_cutpoints/"{v1,v3}
+cp data/cutpoints/v1/cutpoints.json \
+  "$KALSHI_ENGINE_WAREHOUSE/models/phase4_cutpoints/v1/cutpoints.json"
+cp data/cutpoints/v3/cutpoints.json \
+  "$KALSHI_ENGINE_WAREHOUSE/models/phase4_cutpoints/v3/cutpoints.json"
+```
+
+VERIFY:
+```bash
+python -c "import json,os; p=os.environ['KALSHI_ENGINE_WAREHOUSE']+'/models/phase4_cutpoints/v1/cutpoints.json'; print('OK', json.load(open(p))['version'])"
+# Should print: OK phase4_v1
+```
+
+Troubleshooting:
+- *`FileNotFoundError: cutpoints.json`* on engine boot — re-run the copy
+  commands above. The engine looks for `<version>/cutpoints.json` under
+  the warehouse, NOT the repo's `data/cutpoints/`.
+
+---
+
 ## 8. Verify config loads (no orders, no network)
 
 This step boots only the config module to confirm env vars resolve.
@@ -334,10 +378,10 @@ TOD-skip gate (briefly run as `--time-of-day-skip disabled`) was
 reverted after a single previously-blocked cycle produced a -$3.40
 loss. The gate is doing real protective work; leave it enabled.
 
-The Phase 4 cutpoints model expects an artefact at
-`<warehouse>/models/phase4_cutpoints/v1/cutpoints.json`. If it is
-missing, the engine will crash with a clear FileNotFoundError. Ask the
-user for this file — it is not shipped with the public package.
+The Phase 4 cutpoints artefact is bundled in the repo at
+`data/cutpoints/{v1,v3}/cutpoints.json`. Section 7.5 above shows how
+to copy it into the warehouse. If the file is missing the engine will
+crash with `FileNotFoundError` on boot — re-run that step.
 
 Expected:
 - Process stays running (no exit).

@@ -53,8 +53,9 @@ KALSHI_PRIVATE_KEY_PATH=<absolute-path-to-your-rsa-key.pem>
 The engine creates subdirectories under `$KALSHI_ENGINE_WAREHOUSE` on first
 use (`raw/`, `derived/`, `models/`, `fixtures/`, `backtest_results/`,
 `meta/`). The Phase 4 cutpoints artefact must be present at
-`<warehouse>/models/phase4_cutpoints/v1/cutpoints.json` — see
-`tests/fixtures/` if you need a sample.
+`<warehouse>/models/phase4_cutpoints/{v1,v3}/cutpoints.json`. The repo
+bundles both versions under `data/cutpoints/` — see
+[INSTALL.md §7.5](INSTALL.md) for the copy commands a fresh install needs.
 
 ## Run
 

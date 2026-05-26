@@ -1,0 +1,27 @@
+{
+  "version": "phase4_v3",
+  "created_at": "2026-05-24T12:30:00Z",
+  "source": "Phase 12.5 per-crypto threshold recalibration (Rec 3 of alpha-recovery scorecard). LIVE n=209 + Phase 4 n=218 = combined n=427 grid search of skip_min_bps multipliers per crypto. Selected mult that maximizes PnL with WR >= 87%.",
+  "vol_30m_percentile_skip_above": 0.67,
+  "vol_30m_percentile_upsize_below": 0.50,
+  "bb_div_skip_above": 0.09,
+  "bb_div_upsize_below": -0.03,
+  "bps_thresholds": {
+    "BTC": 3.9491400035563857,
+    "ETH": 12.0,
+    "SOL": 13.0,
+    "XRP": 11.85,
+    "DOGE": 7.885053443139985
+  },
+  "bps_thresholds_changed_from_v1": {
+    "BTC": "unchanged (1.5x at this threshold was already PnL-optimal)",
+    "ETH": "4.81 -> 12.0 (2.5x of v1). v1 had n=64 -$2.69 vs n=16 +$0.82 at 2.5x; severely under-discriminating.",
+    "SOL": "6.49 -> 13.0 (2.0x of v1). v1 had n=68 -$0.54 vs n=27 +$3.02 at 2x; clear inflection.",
+    "XRP": "5.92 -> 11.85 (2.0x of v1). v1 had n=54 +$0.51 vs n=21 +$2.40 at 2x.",
+    "DOGE": "unchanged (1.5x already optimal: n=36 +$1.47 vs n=2 +$0.04 at 3x)."
+  },
+  "vol_history_window_hours": 12.5,
+  "vol_window_minutes": 30,
+  "sigma_for_bb_fair_bps_per_min": "computed from vol_30m at evaluation time",
+  "notes": "These thresholds become the HARD SKIP gate. The 5tier scheme's `s_bps` (align signal, 1.5x mult) and `bps_strong` (5tier sizing, 2x mult) continue to use multipliers OF THE NEW THRESHOLD - intentionally conservative for ETH/SOL/XRP given the cost-asymmetry concern surfaced in alpha-recovery audit. BTC/DOGE behavior is unchanged."
+}
