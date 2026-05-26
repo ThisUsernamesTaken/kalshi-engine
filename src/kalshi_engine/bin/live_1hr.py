@@ -104,15 +104,13 @@ def parse_args(argv=None) -> argparse.Namespace:
                    choices=["favorite_chase"])
     p.add_argument("--model", default="phase4_cutpoints",
                    choices=["phase4_cutpoints"])
-    p.add_argument("--cryptos", default="BTC",
-                   help="comma-separated crypto symbols. Default BTC-only — "
-                        "Kalshi has 7 1hr crypto series but only KXBTCD has "
-                        "deep enough book (463ct @ 50c) to reliably fill 3ct "
-                        "orders without partial-fill or price-slip risk. "
-                        "KXETHD (217ct @ 50c) is the next-best and could be "
-                        "added back via --cryptos BTC,ETH. KXSOLD / KXXRPD / "
-                        "KXDOGED / KXHYPED / KXBNBD are all 1-2ct deep — "
-                        "use observer instead of live trader for those.")
+    p.add_argument("--cryptos", default="BTC,ETH",
+                   help="comma-separated crypto symbols. Default BTC+ETH — "
+                        "only KXBTCD (463ct @ 50c) and KXETHD (217ct @ 50c) "
+                        "have deep enough books for reliable 7-10ct fills. "
+                        "KXSOLD / KXXRPD / KXDOGED / KXHYPED / KXBNBD are "
+                        "all 1-2ct deep — use observer instead of live "
+                        "trader for those.")
     p.add_argument("--align-mode", default="5tier_v13b_1to3_flat",
                    choices=["disabled", "2tier", "3tier", "5tier",
                             "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4",
