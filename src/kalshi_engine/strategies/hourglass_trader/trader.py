@@ -78,6 +78,7 @@ class HourglassTraderStrategy:
         max_favorite_cost_decicents: int = 920,
         max_contracts: int = 3,
         per_crypto_max_contracts: dict[str, int] | None = None,
+        per_crypto_models: dict[str, Phase4CutpointsModel] | None = None,
     ) -> None:
         if log_writer is None:
             raise ValueError("HourglassTraderStrategy requires a log_writer")
@@ -105,6 +106,17 @@ class HourglassTraderStrategy:
             if v < 1:
                 raise ValueError(
                     f"per_crypto_max_contracts[{k}]={v} must be >= 1")
+        # Phase 14.3 — per-crypto align-mode override. Each value is a
+        # fully-constructed Phase4CutpointsModel pre-configured with the
+        # desired align_mode. Missing crypto => fall back to the global
+        # ``model``. Use case: BTC keeps T6 (7/10/10), ETH uses 1to3_ramp
+        # at 1/2/3-by-score while we collect ETH cohort data.
+        if per_crypto_models is None:
+            self.per_crypto_models: dict[str, Phase4CutpointsModel] = {}
+        else:
+            self.per_crypto_models = {
+                str(k).upper(): m for k, m in per_crypto_models.items()
+            }
         self.markets: dict[str, HourMarketMeta] = {}
         # Per-crypto rolling state (spot/vol/bb_div). Shared FavoriteChaseState
         # implementation since the math is identical for 1hr cycles — the only
@@ -237,7 +249,10 @@ class HourglassTraderStrategy:
                 diag_base,
             )
         state = self._state(crypto)
-        decision = self._model.evaluate(
+        # Phase 14.3 — per-crypto align-mode override. Use a crypto-specific
+        # model if one was registered; else fall back to the global model.
+        active_model = self.per_crypto_models.get(crypto.upper(), self._model)
+        decision = active_model.evaluate(
             state=state,
             ticker=book.ticker,
             side=fav_side,

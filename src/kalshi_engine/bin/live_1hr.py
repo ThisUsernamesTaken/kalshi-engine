@@ -139,6 +139,14 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "to --max-contracts uniformly. Use for asset-class-tier "
                         "risk reduction (e.g. ETH at 1ct while BTC stays at 10ct "
                         "while ETH-specific gates are being calibrated).")
+    p.add_argument("--per-crypto-align-mode", default="",
+                   help="Phase 14.3 — per-crypto align-mode override. Format: "
+                        "'BTC=5tier_v13b_7_10_10,ETH=5tier_v13b_1to3_ramp'. Each "
+                        "entry RESHAPES that crypto's sizing schedule (not just "
+                        "a cap). Missing crypto falls back to the global "
+                        "--align-mode. Use for asset-class-tier sizing schemes "
+                        "(e.g. ETH on a 1/2/3 ramp by score while BTC keeps T6 "
+                        "7/10/10). Each value must be a registered align mode.")
     p.add_argument("--daily-cap-cents", type=int, default=1000,
                    help="Daily realized-loss cap in cents. Default 1000 ($10). "
                         "Independent from the 15m engine's separate $10 cap.")
@@ -489,6 +497,30 @@ async def _amain(args: argparse.Namespace) -> int:
             print(f"ERROR: invalid --per-crypto-max-contracts "
                   f"{args.per_crypto_max_contracts!r}: {exc}", file=sys.stderr)
             return 2
+    # Phase 14.3 — per-crypto align-mode override. Build a separate
+    # Phase4CutpointsModel per (crypto, align_mode) pair.
+    per_crypto_align: dict[str, str] = {}
+    per_crypto_models: dict[str, Phase4CutpointsModel] = {}
+    if args.per_crypto_align_mode.strip():
+        try:
+            for pair in args.per_crypto_align_mode.split(","):
+                k, v = pair.strip().split("=", 1)
+                per_crypto_align[k.strip().upper()] = v.strip()
+        except (ValueError, IndexError) as exc:
+            print(f"ERROR: invalid --per-crypto-align-mode "
+                  f"{args.per_crypto_align_mode!r}: {exc}", file=sys.stderr)
+            return 2
+        for crypto, am in per_crypto_align.items():
+            try:
+                per_crypto_models[crypto] = Phase4CutpointsModel(
+                    cutpoints_path=str(cutpoints_path),
+                    align_mode=am,
+                    time_of_day_skip=False,
+                )
+            except ValueError as exc:
+                print(f"ERROR: --per-crypto-align-mode {crypto}={am}: {exc}",
+                      file=sys.stderr)
+                return 2
     strategy = HourglassTraderStrategy(
         log_writer=log,
         model=model,
@@ -497,6 +529,7 @@ async def _amain(args: argparse.Namespace) -> int:
         max_favorite_cost_decicents=args.max_favorite_cost_decicents,
         max_contracts=args.max_contracts,
         per_crypto_max_contracts=per_crypto_caps or None,
+        per_crypto_models=per_crypto_models or None,
     )
     envelope = RiskEnvelope(
         daily_loss_cap_cents=args.daily_cap_cents,
@@ -556,6 +589,7 @@ async def _amain(args: argparse.Namespace) -> int:
             "max_favorite_cost_decicents": args.max_favorite_cost_decicents,
             "max_contracts": args.max_contracts,
             "per_crypto_max_contracts": per_crypto_caps,
+            "per_crypto_align_mode": per_crypto_align,
             "daily_cap_cents": args.daily_cap_cents,
             "spot_source": args.spot_source,
             "stop_mode": args.stop_mode,

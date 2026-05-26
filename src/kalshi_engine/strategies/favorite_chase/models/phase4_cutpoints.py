@@ -167,6 +167,23 @@ LOOSE_SIZE_BORDERLINE = 3
 H1TO3_FLAT_SKIP_BELOW = 4.0
 H1TO3_FLAT_SIZE = 3
 
+# Phase 14.3 (V13b 1to3 RAMP) — gradient sizing for the ETH forward-test on
+# the 1hr engine. Same V13b score formula + hard gates as 5tier_v13b. SKIPs
+# score<4 (H1 floor). On what passes, sizes by gradient:
+#     4.0 <= score < 5.0   -> 1 ct
+#     5.0 <= score < 6.0   -> 2 ct
+#     score >= 6.0         -> 3 ct
+# At 3ct * MAX_FAV_COST=920 the worst-case ETH single-trade loss is $2.76
+# (vs $9.26 in the prior unrestricted T6 schedule). The $10/day cap binds
+# at ~3-4 max-tier ETH losses, giving us a meaningful ETH sample at
+# bounded risk while the n=4 BB-position discriminator (Phase 14.2a) gets
+# validated on a larger cohort. Used via --per-crypto-align-mode override;
+# BTC keeps T6 unchanged.
+RAMP_SKIP_BELOW = 4.0
+RAMP_SIZE_TIER1 = 1   # 4.0 <= score < 5.0
+RAMP_SIZE_TIER2 = 2   # 5.0 <= score < 6.0
+RAMP_SIZE_TIER3 = 3   # score >= 6.0
+
 # Phase 14.0 (V13b EQUITY 1ct flat) — minimum-risk launch sizing for the
 # first live equity-index engine (KXINXU). Same V13b score formula + hard
 # gates as 5tier_v13b. SKIPs score<4 (H1 floor). All passing trades at a
@@ -219,7 +236,7 @@ ALIGN_MODES = ("disabled", "2tier", "3tier", "5tier",
                "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4",
                "5tier_v13b_1to3_flat", "5tier_v13b_10_flat",
                "5tier_v13b_7_10_10", "5tier_v13b_h1h4_loose",
-               "5tier_v13b_equity_1ct_flat")
+               "5tier_v13b_equity_1ct_flat", "5tier_v13b_1to3_ramp")
 
 
 class Phase4CutpointsModel:
@@ -756,6 +773,55 @@ class Phase4CutpointsModel:
                 ticker=ticker, action=Action.ENTER, side=side, size=size,
                 confidence=conf,
                 reason=(f"5TIER_V13B_1TO3_FLAT score={score:.1f} -> {size}ct "
+                        f"(div_band={bb_div_band} side_no={side_no} "
+                        f"bps_strong={bps_strong} super_band={super_band})"),
+                diagnostics=diag)
+
+        if self.align_mode == "5tier_v13b_1to3_ramp":
+            # Phase 14.3 — gradient sizing for the ETH forward-test on 1hr.
+            # Same V13b score + hard gates as 5tier_v13b. SKIPs <4, then
+            # ramps 1/2/3 by score tier. Worst single-trade loss $2.76
+            # (3ct * MAX_FAV_COST=920). Designed for use via
+            # --per-crypto-align-mode while BTC keeps T6 unchanged.
+            if s_bps == 0:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_1TO3_RAMP skip: s_bps=0 "
+                    f"(bps_margin {bps_margin:.2f} <= "
+                    f"{ALIGN_BPS_MULT}*{threshold:.2f})", diag)
+            bb_div_band = 1 if (DEEP_DIV_SKIP < bb_div <= DIV_BAND_UPPER) else 0
+            side_no = 1 if side is Side.NO else 0
+            side_yes = 1 - side_no
+            bps_strong = 1 if bps_margin > BPS_STRONG_MULT * threshold else 0
+            super_band = 1 if (SUPER_BAND_LOW < bb_div <= SUPER_BAND_HIGH) else 0
+            score = (2.0 * bb_div_band + 1.5 * side_no
+                     + 2.0 * bps_strong + 1.0 * super_band)
+            diag.update({
+                "bb_div_band": bb_div_band,
+                "bps_strong": bps_strong,
+                "side_yes": side_yes,
+                "side_no": side_no,
+                "super_band": super_band,
+                "score_5tier_v13b_1to3_ramp": score,
+            })
+            if score < RAMP_SKIP_BELOW:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_1TO3_RAMP skip: score={score:.1f} < "
+                    f"{RAMP_SKIP_BELOW} (div_band={bb_div_band} "
+                    f"side_no={side_no} bps_strong={bps_strong} "
+                    f"super_band={super_band})", diag)
+            if score < 5.0:
+                size = RAMP_SIZE_TIER1
+            elif score < 6.0:
+                size = RAMP_SIZE_TIER2
+            else:
+                size = RAMP_SIZE_TIER3
+            conf = min(1.0, score / 6.5)
+            return Decision(
+                ticker=ticker, action=Action.ENTER, side=side, size=size,
+                confidence=conf,
+                reason=(f"5TIER_V13B_1TO3_RAMP score={score:.1f} -> {size}ct "
                         f"(div_band={bb_div_band} side_no={side_no} "
                         f"bps_strong={bps_strong} super_band={super_band})"),
                 diagnostics=diag)
