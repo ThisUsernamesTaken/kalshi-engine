@@ -140,7 +140,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Comma-separated minute marks into each cycle where "
                         "the trader evaluates and may enter. Default 15,30,50 — "
                         "earlier T+15 scan catches favorites before they pin "
-                        "near 99c (observer data: 95%+ of T+50 favorites are "
+                        "near 99c (observer data: 95%%+ of T+50 favorites are "
                         "already at 99c where Kalshi fees eat the edge). "
                         "T+45 is intentionally absent per the observer "
                         "tier sweep (-$5.79).")
