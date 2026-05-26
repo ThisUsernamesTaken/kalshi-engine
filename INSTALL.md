@@ -412,7 +412,7 @@ python -m kalshi_engine.bin.live_1hr \
     --align-mode 5tier_v13b_7_10_10 \
     --max-contracts 10 \
     --reentry-mode disabled \
-    --trigger-minutes 30,50 \
+    --trigger-minutes 15,30,50 \
     --skip-hours 13 \
     --max-favorite-cost-decicents 920 \
     --cryptos BTC,ETH \
@@ -428,9 +428,11 @@ Notes:
   10ct@score[5,6), 10ct@score>=6`. From the 1hr observer tier sweep:
   95% of T3's PnL with a tighter score-4 tail (-$4.90 vs -$7.00 worst
   trade).
-- `--trigger-minutes 30,50`: 1hr cycles get evaluated at T+30 and T+50
-  (mins into the hour). T+45 is intentionally skipped (was -$5.79 in
-  the sweep).
+- `--trigger-minutes 15,30,50`: 1hr cycles get evaluated at T+15, T+30,
+  and T+50 (mins into the hour). The T+15 scan catches favorites
+  before they pin near 99¢ — observer data showed 95%+ of T+50
+  favorites already sat at 99¢ where Kalshi fees eat the edge. T+45
+  is intentionally absent (was -$5.79 in the sweep).
 - `--skip-hours 13`: UTC 13Z blocked (37.5% WR / -$84.17 in the sweep).
 - `--max-favorite-cost-decicents 920`: hard cap on entry-side cost at
   92¢ — protects against the Kalshi fee trap that eats edge above 95¢.

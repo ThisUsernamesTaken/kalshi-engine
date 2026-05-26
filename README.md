@@ -141,7 +141,7 @@ python -m kalshi_engine.bin.live_1hr \
     --align-mode 5tier_v13b_7_10_10 \
     --max-contracts 10 \
     --reentry-mode disabled \
-    --trigger-minutes 30,50 \
+    --trigger-minutes 15,30,50 \
     --skip-hours 13 \
     --max-favorite-cost-decicents 920 \
     --cryptos BTC,ETH \
@@ -155,9 +155,11 @@ python -m kalshi_engine.bin.live_1hr \
 for the 1hr engine: same V13b score formula, then `skip<4, 7ct[4,5),
 10ct[5,6), 10ct>=6`. Earlier conservative variant `5tier_v13b_1to3_flat`
 (flat 3ct on score>=4) is preserved as a selectable option for lower
-exposure. `--trigger-minutes 30,50` and `--skip-hours 13` come from the
-1hr observer tier sweep — T+45 was actively losing and 13Z was -$84/16
-trades.
+exposure. `--trigger-minutes 15,30,50` adds an earlier T+15 scan to
+catch favorites before they pin near 99¢ — observer data shows 95%+
+of T+50 favorites already sit at 99¢ where Kalshi fees eliminate the
+edge. `--skip-hours 13` comes from the 1hr observer tier sweep — T+45
+was actively losing and 13Z was -$84/16 trades.
 
 ### 1-hour observer (Phase 13.0 — read-only)
 

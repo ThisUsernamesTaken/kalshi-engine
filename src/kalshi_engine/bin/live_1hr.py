@@ -136,10 +136,14 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "Independent from the 15m engine's separate $10 cap.")
     p.add_argument("--cutpoints-version", default="v1",
                    help="Cutpoints artifact version (cutpoints.json file).")
-    p.add_argument("--trigger-minutes", default="30,50",
+    p.add_argument("--trigger-minutes", default="15,30,50",
                    help="Comma-separated minute marks into each cycle where "
-                        "the trader evaluates and may enter. Default 30,50 — "
-                        "skips T+45 per the observer sweep (-$5.79).")
+                        "the trader evaluates and may enter. Default 15,30,50 — "
+                        "earlier T+15 scan catches favorites before they pin "
+                        "near 99c (observer data: 95%+ of T+50 favorites are "
+                        "already at 99c where Kalshi fees eat the edge). "
+                        "T+45 is intentionally absent per the observer "
+                        "tier sweep (-$5.79).")
     p.add_argument("--skip-hours", default="13",
                    help="Comma-separated UTC hours to skip entries in. Default "
                         "13 — the observer sweep flagged 13Z as catastrophic "
