@@ -232,11 +232,41 @@ T6_SIZE_AT_6 = 10
 # 9 winners worth $1.93 — net +$4.49 backtest improvement.
 DOGE_BPS_FLOOR = 10.0
 
+# Phase 14.9 (V13b BTC d_norm danger-zone gate) — BTC-targeted gate built on
+# the d_norm diagnostic shipped in Phase 14.7. d_norm is the vol-normalized
+# distance to strike: bps_margin / (vol_30m * sqrt(tau_min)). The cluster
+# analysis on KXBTCD T+30/40/50 decisions identified d_norm in [1.5, 2.0]
+# as the *crossing-risk band* — far enough that the V13b score frequently
+# crosses 4 (so the existing H1 floor passes them), but close enough that
+# the BB fair distribution puts meaningful mass on the wrong side of strike.
+# This is where the 1hr engine accumulated losses on 2026-05-26 before the
+# 25h-cycle pollution was caught.
+#
+# Logic (BTC only, via per-crypto override):
+#     score < 4.0                       -> SKIP   (H1 floor)
+#     score in [4.0, +inf) AND
+#         d_norm in [1.5, 2.0]          -> SKIP   (Phase 14.9 danger zone)
+#     score in [4.0, 5.0)               -> 7 ct
+#     score in [5.0, 6.0)               -> 9 ct
+#     score >= 6.0                      -> 10 ct
+#
+# Sizing schedule is asymmetric like T6 (7/10/10) but trims the score=5
+# tier from 10ct -> 9ct to be slightly more conservative through the
+# rollout of the new gate. Worst single-trade loss bounded at
+# 10ct * MAX_FAV_COST=920 = ~$9.20.
+DNORM_GATE_LOW = 1.5
+DNORM_GATE_HIGH = 2.0
+DNORM_GATE_SKIP_BELOW = 4.0
+DNORM_GATE_SIZE_AT_4 = 7
+DNORM_GATE_SIZE_AT_5 = 9
+DNORM_GATE_SIZE_AT_6 = 10
+
 ALIGN_MODES = ("disabled", "2tier", "3tier", "5tier",
                "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4",
                "5tier_v13b_1to3_flat", "5tier_v13b_10_flat",
                "5tier_v13b_7_10_10", "5tier_v13b_h1h4_loose",
-               "5tier_v13b_equity_1ct_flat", "5tier_v13b_1to3_ramp")
+               "5tier_v13b_equity_1ct_flat", "5tier_v13b_1to3_ramp",
+               "5tier_v13b_btc_dnorm_gate")
 
 
 class Phase4CutpointsModel:
@@ -832,6 +862,69 @@ class Phase4CutpointsModel:
                 confidence=conf,
                 reason=(f"5TIER_V13B_1TO3_RAMP score={score:.1f} -> {size}ct "
                         f"(div_band={bb_div_band} side_no={side_no} "
+                        f"bps_strong={bps_strong} super_band={super_band})"),
+                diagnostics=diag)
+
+        if self.align_mode == "5tier_v13b_btc_dnorm_gate":
+            # Phase 14.9 — BTC d_norm danger-zone gate. Same V13b score
+            # formula + hard gates. SKIPs <4 (H1 floor), AND skips the
+            # [1.5, 2.0] d_norm crossing-risk band identified after the
+            # 2026-05-26 KXBTCD loss cluster. See DNORM_GATE_* docstring.
+            if s_bps == 0:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_BTC_DNORM_GATE skip: s_bps=0 "
+                    f"(bps_margin {bps_margin:.2f} <= "
+                    f"{ALIGN_BPS_MULT}*{threshold:.2f})", diag)
+            bb_div_band = 1 if (DEEP_DIV_SKIP < bb_div <= DIV_BAND_UPPER) else 0
+            side_no = 1 if side is Side.NO else 0
+            side_yes = 1 - side_no
+            bps_strong = 1 if bps_margin > BPS_STRONG_MULT * threshold else 0
+            super_band = 1 if (SUPER_BAND_LOW < bb_div <= SUPER_BAND_HIGH) else 0
+            score = (2.0 * bb_div_band + 1.5 * side_no
+                     + 2.0 * bps_strong + 1.0 * super_band)
+            diag.update({
+                "bb_div_band": bb_div_band,
+                "bps_strong": bps_strong,
+                "side_yes": side_yes,
+                "side_no": side_no,
+                "super_band": super_band,
+                "score_5tier_v13b_btc_dnorm_gate": score,
+                "dnorm_gate_low": DNORM_GATE_LOW,
+                "dnorm_gate_high": DNORM_GATE_HIGH,
+            })
+            if score < DNORM_GATE_SKIP_BELOW:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_BTC_DNORM_GATE skip: score={score:.1f} < "
+                    f"{DNORM_GATE_SKIP_BELOW} (div_band={bb_div_band} "
+                    f"side_no={side_no} bps_strong={bps_strong} "
+                    f"super_band={super_band})", diag)
+            # Phase 14.9 danger-zone gate. d_norm may be None if vol or tau
+            # is degenerate; in that case we fall through to the size tiers
+            # (no gate) — same conservative-on-failure posture as the
+            # bb_fair/spot None branches above.
+            if (d_norm is not None
+                    and DNORM_GATE_LOW <= d_norm <= DNORM_GATE_HIGH):
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_BTC_DNORM_GATE danger-zone skip: "
+                    f"d_norm={d_norm:.3f} in "
+                    f"[{DNORM_GATE_LOW}, {DNORM_GATE_HIGH}] "
+                    f"(score={score:.1f} would have passed)", diag)
+            if score < 5.0:
+                size = DNORM_GATE_SIZE_AT_4
+            elif score < 6.0:
+                size = DNORM_GATE_SIZE_AT_5
+            else:
+                size = DNORM_GATE_SIZE_AT_6
+            conf = min(1.0, score / 6.5)
+            return Decision(
+                ticker=ticker, action=Action.ENTER, side=side, size=size,
+                confidence=conf,
+                reason=(f"5TIER_V13B_BTC_DNORM_GATE score={score:.1f} "
+                        f"d_norm={d_norm if d_norm is None else f'{d_norm:.3f}'} "
+                        f"-> {size}ct (div_band={bb_div_band} side_no={side_no} "
                         f"bps_strong={bps_strong} super_band={super_band})"),
                 diagnostics=diag)
 

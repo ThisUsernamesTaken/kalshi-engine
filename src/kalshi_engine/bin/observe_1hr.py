@@ -34,6 +34,11 @@ from kalshi_engine.config import RAW_DIR
 
 DEFAULT_LOG_PATH = str(RAW_DIR / "live_logs" / "hourglass_observer.jsonl")
 
+# Phase 14.8 — max cycle duration for "1hr" observer markets. Anything
+# longer (e.g. 25h daily cycles that occasionally share KX*D series) is
+# rejected to keep the research cohort clean.
+MAX_1HR_CYCLE_MIN = 90
+
 
 def _strike_from_market(m: dict) -> float:
     """Best-effort strike extraction.
@@ -113,6 +118,7 @@ async def _discover_1hr_markets(
     client: KalshiClient, cryptos: list[Crypto], log: LiveLogWriter,
 ) -> list[dict]:
     out: list[dict] = []
+    skipped_long = 0
     for crypto in cryptos:
         series = SERIES_1HR_FOR_CRYPTO[crypto]
         try:
@@ -130,6 +136,18 @@ async def _discover_1hr_markets(
             close_ms = _iso_to_ms(m.get("close_time"))
             if not ticker or strike <= 0 or open_ms is None or close_ms is None:
                 continue
+            # Phase 14.8 — reject non-1hr markets so research data isn't
+            # polluted by 25h-cycle envelopes registered as if 1hr.
+            dur_min = (close_ms - open_ms) / 60_000.0
+            if dur_min > MAX_1HR_CYCLE_MIN:
+                log.write({
+                    "kind": "discovery_skip_long_cycle",
+                    "series": series, "ticker": ticker,
+                    "duration_minutes": dur_min,
+                    "cap_minutes": MAX_1HR_CYCLE_MIN,
+                })
+                skipped_long += 1
+                continue
             out.append({
                 "ticker": ticker, "strike": strike,
                 "open_ms": open_ms, "close_ms": close_ms, "series": series,
@@ -137,7 +155,8 @@ async def _discover_1hr_markets(
     counts: dict[str, int] = {}
     for m in out:
         counts[m["series"]] = counts.get(m["series"], 0) + 1
-    log.write({"kind": "discovery", "count": len(out), "by_series": counts})
+    log.write({"kind": "discovery", "count": len(out), "by_series": counts,
+                "skipped_long_cycle_count": skipped_long})
     return out
 
 
@@ -168,6 +187,16 @@ async def _discovery_loop(
                     open_ms = _iso_to_ms(m.get("open_time"))
                     close_ms = _iso_to_ms(m.get("close_time"))
                     if strike <= 0 or open_ms is None or close_ms is None:
+                        continue
+                    # Phase 14.8 — same cycle-duration filter as boot
+                    dur_min = (close_ms - open_ms) / 60_000.0
+                    if dur_min > MAX_1HR_CYCLE_MIN:
+                        log.write({
+                            "kind": "discovery_skip_long_cycle",
+                            "series": series, "ticker": ticker,
+                            "duration_minutes": dur_min,
+                            "cap_minutes": MAX_1HR_CYCLE_MIN,
+                        })
                         continue
                     observer.register_market(ticker, strike, open_ms, close_ms)
                     newly[series].append(ticker)

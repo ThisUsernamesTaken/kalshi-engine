@@ -49,6 +49,12 @@ from kalshi_engine.warehouse.settlement import _iso_to_ms
 
 DEFAULT_LOG_PATH = RAW_DIR / "live_logs" / "live_hourglass_trader.jsonl"
 
+# Phase 14.8 — maximum cycle duration for "1hr" markets. Anything longer
+# than this is treated as a non-1hr market (e.g. 25h daily cycle) and
+# rejected from discovery. 90 minutes gives 30-min slack over the natural
+# 60-min cycle to absorb any Kalshi rounding/timing quirks.
+MAX_1HR_CYCLE_MIN = 90
+
 
 def _strike_from_market(m: dict) -> float:
     """Best-effort strike extraction.
@@ -194,6 +200,7 @@ async def _discover_1hr_markets(
     with a warning rather than treated as an error.
     """
     out: list[dict] = []
+    skipped_long: list[dict] = []
     missing_series: list[str] = []
     for crypto in cryptos:
         series = SERIES_1HR_FOR_CRYPTO.get(crypto)
@@ -221,6 +228,23 @@ async def _discover_1hr_markets(
             close_ms = _iso_to_ms(m.get("close_time"))
             if not ticker or strike <= 0 or open_ms is None or close_ms is None:
                 continue
+            # Phase 14.8 — cycle-duration filter. KXBTCD/KXETHD/KXSOLD/etc
+            # series occasionally contain non-1hr markets (e.g. 25h daily
+            # cycles that opened 20:00Z today and close 21:00Z tomorrow).
+            # The 1hr engine assumes τ=close-now ≤ ~60min in its math; a
+            # 25h market with the same ticker scheme broke the entire risk
+            # model on 2026-05-26. Reject anything > MAX_1HR_CYCLE_MIN.
+            dur_min = (close_ms - open_ms) / 60_000.0
+            if dur_min > MAX_1HR_CYCLE_MIN:
+                log.write({
+                    "kind": "discovery_skip_long_cycle",
+                    "series": series, "ticker": ticker,
+                    "duration_minutes": dur_min,
+                    "cap_minutes": MAX_1HR_CYCLE_MIN,
+                })
+                skipped_long.append({"ticker": ticker, "duration_minutes": dur_min,
+                                      "series": series})
+                continue
             out.append({
                 "ticker": ticker, "strike": strike,
                 "open_ms": open_ms, "close_ms": close_ms, "series": series,
@@ -231,6 +255,7 @@ async def _discover_1hr_markets(
     log.write({
         "kind": "discovery", "count": len(out), "by_series": counts,
         "missing_series_for_cryptos": missing_series,
+        "skipped_long_cycle_count": len(skipped_long),
     })
     return out
 
@@ -264,6 +289,16 @@ async def _discovery_loop(
                     open_ms = _iso_to_ms(m.get("open_time"))
                     close_ms = _iso_to_ms(m.get("close_time"))
                     if strike <= 0 or open_ms is None or close_ms is None:
+                        continue
+                    # Phase 14.8 — same cycle-duration filter as boot discovery
+                    dur_min = (close_ms - open_ms) / 60_000.0
+                    if dur_min > MAX_1HR_CYCLE_MIN:
+                        log.write({
+                            "kind": "discovery_skip_long_cycle",
+                            "series": series, "ticker": ticker,
+                            "duration_minutes": dur_min,
+                            "cap_minutes": MAX_1HR_CYCLE_MIN,
+                        })
                         continue
                     strategy.register_market(ticker, strike, open_ms, close_ms)
                     newly[series].append(ticker)

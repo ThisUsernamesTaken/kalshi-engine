@@ -42,6 +42,11 @@ from kalshi_engine.warehouse.settlement import _iso_to_ms
 
 DEFAULT_LOG_PATH = str(RAW_DIR / "live_logs" / "inxu_observer.jsonl")
 
+# Phase 14.8 — KXINXU/KXNASDAQ100U are 1hr cycles. Cap at 90 min to reject
+# any future markets that ship with longer (e.g. daily) cycles, mirroring
+# the 25h-cycle pollution found in KXBTCD on 2026-05-26.
+MAX_INXU_CYCLE_MIN = 90
+
 
 def _diag(msg: str) -> None:
     print(f"[diag] {msg}", file=sys.stderr, flush=True)
@@ -135,6 +140,7 @@ async def _discover_markets(client: KalshiClient, equities: list[Equity],
                              log: LiveLogWriter,
                              ) -> list[dict]:
     out: list[dict] = []
+    skipped_long = 0
     for eq in equities:
         spec = SPECS[eq]
         try:
@@ -152,6 +158,15 @@ async def _discover_markets(client: KalshiClient, equities: list[Equity],
             close_ms = _iso_to_ms(m.get("close_time"))
             if not ticker or strike <= 0 or open_ms is None or close_ms is None:
                 continue
+            # Phase 14.8 — cycle-duration filter (KXBTCD 25h pollution 2026-05-26).
+            dur_min = (close_ms - open_ms) / 60_000.0
+            if dur_min > MAX_INXU_CYCLE_MIN:
+                log.write({"kind": "discovery_skip_long_cycle",
+                           "series": spec.kalshi_series, "ticker": ticker,
+                           "duration_minutes": dur_min,
+                           "cap_minutes": MAX_INXU_CYCLE_MIN})
+                skipped_long += 1
+                continue
             out.append({
                 "ticker": ticker, "strike": strike,
                 "open_ms": open_ms, "close_ms": close_ms,
@@ -160,7 +175,9 @@ async def _discover_markets(client: KalshiClient, equities: list[Equity],
     counts: dict[str, int] = {}
     for m in out:
         counts[m["series"]] = counts.get(m["series"], 0) + 1
-    log.write({"kind": "discovery", "count": len(out), "by_series": counts})
+    log.write({"kind": "discovery", "count": len(out),
+               "by_series": counts,
+               "skipped_long_cycle_count": skipped_long})
     return out
 
 
@@ -327,6 +344,15 @@ async def _discovery_loop(client: KalshiClient, equities: list,
                     open_ms = _iso_to_ms(m.get("open_time"))
                     close_ms = _iso_to_ms(m.get("close_time"))
                     if strike <= 0 or open_ms is None or close_ms is None:
+                        continue
+                    # Phase 14.8 — cycle-duration filter.
+                    dur_min = (close_ms - open_ms) / 60_000.0
+                    if dur_min > MAX_INXU_CYCLE_MIN:
+                        log.write({"kind": "discovery_skip_long_cycle",
+                                    "series": spec.kalshi_series,
+                                    "ticker": ticker,
+                                    "duration_minutes": dur_min,
+                                    "cap_minutes": MAX_INXU_CYCLE_MIN})
                         continue
                     state.register(ticker, strike, open_ms, close_ms,
                                     spec.kalshi_series, eq)

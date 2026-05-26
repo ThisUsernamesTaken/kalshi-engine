@@ -49,6 +49,11 @@ from kalshi_engine.warehouse.settlement import _iso_to_ms
 DEFAULT_LOG_PATH = str(RAW_DIR / "live_logs" / "live_inxu_v0.jsonl")
 FAV_CHASE_TRIGGER_DC = 750.0  # don't trade favorites < $0.75
 
+# Phase 14.8 — KXINXU is a 1hr series. Reject any market whose
+# close_ms - open_ms exceeds this cap, mirroring the 25h-cycle pollution
+# defect found in KXBTCD on 2026-05-26.
+MAX_INXU_CYCLE_MIN = 90
+
 
 def _diag(msg: str) -> None:
     print(f"[diag] {msg}", file=sys.stderr, flush=True)
@@ -251,6 +256,7 @@ class InxuShim:
     async def refresh_markets(self) -> None:
         markets = await fetch_kxinxu_markets(self.client)
         new_count = 0
+        skipped_long = 0
         for m in markets:
             t = m.get("ticker")
             strike = _strike_from_market(m)
@@ -258,13 +264,25 @@ class InxuShim:
             close_ms = _iso_to_ms(m.get("close_time"))
             if not t or strike <= 0 or open_ms is None or close_ms is None:
                 continue
+            # Phase 14.8 — cycle-duration filter.
+            dur_min = (close_ms - open_ms) / 60_000.0
+            if dur_min > MAX_INXU_CYCLE_MIN:
+                if t not in self.markets:
+                    self.log.write({"kind": "discovery_skip_long_cycle",
+                                     "series": "KXINXU", "ticker": t,
+                                     "duration_minutes": dur_min,
+                                     "cap_minutes": MAX_INXU_CYCLE_MIN})
+                    skipped_long += 1
+                continue
             if t not in self.markets:
                 new_count += 1
                 self.markets[t] = {"strike": strike, "open_ms": open_ms,
                                     "close_ms": close_ms}
                 self.evaluated.setdefault(t, set())
-        if new_count:
-            self.log.write({"kind": "market_refresh", "new_markets": new_count,
+        if new_count or skipped_long:
+            self.log.write({"kind": "market_refresh",
+                            "new_markets": new_count,
+                            "skipped_long_cycle_count": skipped_long,
                             "total_markets": len(self.markets)})
 
     async def spot_poll_loop(self, deadline: Optional[float]) -> None:

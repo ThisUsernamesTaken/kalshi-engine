@@ -46,6 +46,11 @@ from kalshi_engine.warehouse.settlement import _iso_to_ms
 
 DEFAULT_LOG_PATH = RAW_DIR / "live_logs" / "live_favorite_chase_v2.jsonl"
 
+# Phase 14.8 — max cycle duration for 15m markets. Defensive: reject any
+# market whose close-open span exceeds 18 minutes (natural 15min + 3min
+# slack). Same defect class as the 25h-pollution that broke the 1hr engine.
+MAX_15M_CYCLE_MIN = 18
+
 SERIES_FOR_CRYPTO = {
     Crypto.BTC: "KXBTC15M",
     Crypto.ETH: "KXETH15M",
@@ -190,6 +195,16 @@ async def _discover_markets(
             close_ms = _iso_to_ms(m.get("close_time"))
             if not ticker or strike <= 0 or open_ms is None or close_ms is None:
                 continue
+            # Phase 14.8 — cycle-duration filter for 15m markets.
+            dur_min = (close_ms - open_ms) / 60_000.0
+            if dur_min > MAX_15M_CYCLE_MIN:
+                log.write({
+                    "kind": "discovery_skip_long_cycle",
+                    "series": series, "ticker": ticker,
+                    "duration_minutes": dur_min,
+                    "cap_minutes": MAX_15M_CYCLE_MIN,
+                })
+                continue
             out.append({
                 "ticker": ticker, "strike": strike,
                 "open_ms": open_ms, "close_ms": close_ms,
@@ -250,6 +265,16 @@ async def _market_discovery_loop(
                     open_ms = _iso_to_ms(m.get("open_time"))
                     close_ms = _iso_to_ms(m.get("close_time"))
                     if strike <= 0 or open_ms is None or close_ms is None:
+                        continue
+                    # Phase 14.8 — same cycle-duration filter as boot
+                    dur_min = (close_ms - open_ms) / 60_000.0
+                    if dur_min > MAX_15M_CYCLE_MIN:
+                        log.write({
+                            "kind": "discovery_skip_long_cycle",
+                            "series": series, "ticker": ticker,
+                            "duration_minutes": dur_min,
+                            "cap_minutes": MAX_15M_CYCLE_MIN,
+                        })
                         continue
                     strategy.register_market(ticker, strike, open_ms, close_ms)
                     newly_registered.setdefault(series, []).append(ticker)
