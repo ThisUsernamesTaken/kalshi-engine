@@ -4,6 +4,8 @@
 *.key
 credentials/
 .secrets/
+.alpaca/
+.kalshi/
 
 # Engine logs and live data
 *.log
