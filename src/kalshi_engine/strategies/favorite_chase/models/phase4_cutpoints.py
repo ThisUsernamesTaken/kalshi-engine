@@ -137,8 +137,23 @@ S2_SIZE_AT_6 = 10
 H1H4_SKIP_BELOW = 4.0
 H1H4_SCORE_MULT = 1.8
 
+# Phase 13.1 (V13b 1to3 flat) — compressed-sizing variant for the new 1hr
+# live engine. Same V13b score formula and hard gates as 5tier_v13b. SKIPs
+# everything below score=4.0 (H1 floor — every V13b cohort loss sits at
+# score 3.5; score >= 4 was 58/58 wins on 15m). Sizes ALL passing trades
+# at a flat 3 contracts (the T3 / all-in≥4 winner from the 1hr tier sweep,
+# scaled to a 1-3 ceiling for the unproven 1hr regime):
+#     score < 4.0  -> SKIP
+#     score >= 4.0 -> 3 ct (flat)
+# At 3 ct * $0.92 max-fav-cost the worst single-trade loss is ~$2.76.
+# The $10/day cap covers ~3-4 max-tier losses. Use only for the 1hr engine
+# pilot. Independent default; not validated on 15m.
+H1TO3_FLAT_SKIP_BELOW = 4.0
+H1TO3_FLAT_SIZE = 3
+
 ALIGN_MODES = ("disabled", "2tier", "3tier", "5tier",
-               "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4")
+               "5tier_v13b", "5tier_v13b_s2", "5tier_v13b_h1h4",
+               "5tier_v13b_1to3_flat")
 
 
 class Phase4CutpointsModel:
@@ -478,6 +493,46 @@ class Phase4CutpointsModel:
                 ticker=ticker, action=Action.ENTER, side=side, size=size,
                 confidence=conf,
                 reason=(f"5TIER_V13B_H1H4 score={score:.1f} -> {size}ct "
+                        f"(div_band={bb_div_band} side_no={side_no} "
+                        f"bps_strong={bps_strong} super_band={super_band})"),
+                diagnostics=diag)
+
+        if self.align_mode == "5tier_v13b_1to3_flat":
+            # Phase 13.1 — V13b flat-3ct sizing for the new 1hr engine.
+            # Same V13b score + hard gates. SKIPs <4, sizes ALL passing at 3.
+            if s_bps == 0:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_1TO3_FLAT skip: s_bps=0 (bps_margin {bps_margin:.2f} <= "
+                    f"{ALIGN_BPS_MULT}*{threshold:.2f})", diag)
+            bb_div_band = 1 if (DEEP_DIV_SKIP < bb_div <= DIV_BAND_UPPER) else 0
+            side_no = 1 if side is Side.NO else 0
+            side_yes = 1 - side_no
+            bps_strong = 1 if bps_margin > BPS_STRONG_MULT * threshold else 0
+            super_band = 1 if (SUPER_BAND_LOW < bb_div <= SUPER_BAND_HIGH) else 0
+            score = (2.0 * bb_div_band + 1.5 * side_no
+                     + 2.0 * bps_strong + 1.0 * super_band)
+            diag.update({
+                "bb_div_band": bb_div_band,
+                "bps_strong": bps_strong,
+                "side_yes": side_yes,
+                "side_no": side_no,
+                "super_band": super_band,
+                "score_5tier_v13b_1to3_flat": score,
+            })
+            if score < H1TO3_FLAT_SKIP_BELOW:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_1TO3_FLAT skip: score={score:.1f} < "
+                    f"{H1TO3_FLAT_SKIP_BELOW} (div_band={bb_div_band} "
+                    f"side_no={side_no} bps_strong={bps_strong} "
+                    f"super_band={super_band})", diag)
+            size = H1TO3_FLAT_SIZE
+            conf = min(1.0, score / 6.5)
+            return Decision(
+                ticker=ticker, action=Action.ENTER, side=side, size=size,
+                confidence=conf,
+                reason=(f"5TIER_V13B_1TO3_FLAT score={score:.1f} -> {size}ct "
                         f"(div_band={bb_div_band} side_no={side_no} "
                         f"bps_strong={bps_strong} super_band={super_band})"),
                 diagnostics=diag)
