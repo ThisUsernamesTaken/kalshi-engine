@@ -181,6 +181,40 @@ async def _discover_markets(client: KalshiClient, equities: list[Equity],
     return out
 
 
+async def _discover_markets_with_retry(client: KalshiClient, equities: list[Equity],
+                                        log: LiveLogWriter,
+                                        retry_seconds: int = 300,
+                                        process_label: str = "inxu_observer",
+                                        ) -> list[dict] | None:
+    """Phase 14.11 - retry empty discovery on a sleep loop instead of returning
+    an empty list to the caller. KXINXU markets only exist during US RTH
+    (and the cycle immediately following); between ~21:00Z and ~14:30Z next
+    morning the discovery returns 0 markets. Under NSSM daemonization we want
+    to sleep through the gap, not exit-and-restart-throttle.
+
+    Returns the non-empty market list when discovery succeeds, or ``None`` if
+    the retry sleep is cancelled (graceful shutdown via SIGINT/SIGTERM).
+    """
+    retry_attempts = 0
+    while True:
+        markets = await _discover_markets(client, equities, log)
+        if markets:
+            return markets
+        retry_attempts += 1
+        log.write({
+            "kind": "no_markets_waiting",
+            "process": process_label,
+            "retry_attempts": retry_attempts,
+            "next_retry_s": retry_seconds,
+        })
+        _diag(f"no markets discovered; retry in {retry_seconds}s "
+              f"(attempt {retry_attempts})")
+        try:
+            await asyncio.sleep(retry_seconds)
+        except asyncio.CancelledError:
+            return None
+
+
 async def _handle_book(ev, state: _InxuObserverState,
                         alpaca: AlpacaSpotPoller, log: LiveLogWriter) -> None:
     """On every book update, check if we're inside an observe window for
@@ -269,14 +303,16 @@ async def _amain(args: argparse.Namespace) -> int:
 
     async with KalshiClient(api_key, pem_bytes) as client:
         _diag("discovery start")
-        markets = await _discover_markets(client, equities, log)
+        markets = await _discover_markets_with_retry(
+            client, equities, log,
+            retry_seconds=300, process_label="inxu_observer",
+        )
+        if markets is None:
+            return 0  # cancelled during retry sleep
         for m in markets:
             state.register(m["ticker"], m["strike"], m["open_ms"],
                             m["close_ms"], m["series"], m["equity"])
         _diag(f"registered {len(markets)} markets")
-        if not markets:
-            log.write({"kind": "boot_abort", "reason": "no_markets_discovered"})
-            return 3
 
         log.write({
             "kind": "boot",

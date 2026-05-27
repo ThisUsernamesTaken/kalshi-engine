@@ -50,10 +50,17 @@ env/
 .DS_Store
 Thumbs.db
 
-# Research scripts (kept local — not for distribution)
+# Research scripts (kept local - not for distribution)
 /_*.py
 /_phase4_trades.json
-/scripts/
+# Don't ignore /scripts/ wholesale (Phase 14.11 ships .ps1 deployment
+# scripts there); ignore individual research/probe files instead.
+/scripts/_*.py
+/scripts/dashboard.py
+/scripts/live/
+/scripts/ops/
+/scripts/research/
+/scripts/__pycache__/
 
 # Backtest output (generated)
 backtest_results/

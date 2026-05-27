@@ -59,6 +59,37 @@ def _diag(msg: str) -> None:
     print(f"[diag] {msg}", file=sys.stderr, flush=True)
 
 
+async def _refresh_until_markets_with_retry(shim, log, retry_seconds: int = 300,
+                                              process_label: str = "live_inxu_v0",
+                                              ) -> bool:
+    """Phase 14.11 - sleep+retry until shim.refresh_markets() populates
+    shim.markets. KXINXU has zero active markets between RTH-end ~21:00Z
+    and next RTH ~14:30Z; under NSSM daemonization we want the process
+    alive through that gap, not exit-and-restart-throttling.
+
+    Returns True if cancelled (graceful shutdown), False if discovery
+    succeeded normally.
+    """
+    retry_attempts = 0
+    while True:
+        await shim.refresh_markets()
+        if shim.markets:
+            return False
+        retry_attempts += 1
+        log.write({
+            "kind": "no_markets_waiting",
+            "process": process_label,
+            "retry_attempts": retry_attempts,
+            "next_retry_s": retry_seconds,
+        })
+        _diag(f"no markets discovered; retry in {retry_seconds}s "
+              f"(attempt {retry_attempts})")
+        try:
+            await asyncio.sleep(retry_seconds)
+        except asyncio.CancelledError:
+            return True
+
+
 def _read_env_file(path: str) -> dict[str, str]:
     out: dict[str, str] = {}
     text = Path(path).read_text(encoding="utf-8")
@@ -490,7 +521,11 @@ async def _amain(args: argparse.Namespace) -> int:
     async with KalshiClient(api_key, pem_bytes) as client:
         async with AlpacaSpotPoller(alp_key, alp_sec) as alpaca:
             shim = InxuShim(args, log, model, client, alpaca, alp_key, alp_sec)
-            await shim.refresh_markets()
+            cancelled = await _refresh_until_markets_with_retry(
+                shim, log, retry_seconds=300, process_label="live_inxu_v0",
+            )
+            if cancelled:
+                return 0
             log.write({
                 "kind": "boot",
                 "process": "live_inxu_v0",

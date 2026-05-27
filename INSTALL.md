@@ -536,3 +536,112 @@ python -m kalshi_engine.bin.observe_1hr \
 Subscribes to the 1-hour digital markets; emits pre-trigger book
 envelopes; places no orders. Runs as a separate process from the live
 engine and is safe to run concurrently.
+
+## Appendix C - Production deployment via NSSM services
+
+For long-running deployments, launching the engines from a terminal
+session is fragile - any terminal close, system sleep, or reboot kills
+all child processes. The recommended deployment uses
+[NSSM](https://nssm.cc/) to install each engine as a Windows service
+with auto-restart on failure.
+
+**HUMAN STEP - install NSSM** (one-time, ~2 minutes):
+
+```powershell
+winget install NSSM.NSSM
+```
+
+After install, confirm with `nssm --version`. The Winget package puts
+the binary under
+`C:\Users\<user>\AppData\Local\Microsoft\WinGet\Packages\NSSM.NSSM_*\nssm-*\win64\nssm.exe`.
+The path is hardcoded in `scripts/install_services.ps1` and may need
+to be edited for a different NSSM version.
+
+**STOP - review service definitions before installing.** The 5 services
+created are:
+
+| Service | Purpose | Risk | Daily cap |
+|---|---|---|---|
+| `KalshiEngine15m` | 15m favorite-chase | REAL ORDERS | $10 |
+| `KalshiEngine1hr` | 1hr engine (Phase 14.9 BTC d_norm gate) | REAL ORDERS | $10 |
+| `KalshiObserver1hr` | 1hr crypto read-only | read-only | n/a |
+| `KalshiEngineInxu` | KXINXU equity-index shim | REAL ORDERS | $5 |
+| `KalshiObserverInxu` | KXINXU equity-index read-only | read-only | n/a |
+
+Each service:
+- Runs as `LocalSystem` (same as KalshiCapture).
+- Auto-restarts on exit with 5s delay + 10s throttle.
+- Writes stdout/stderr to `<warehouse>/raw/live_logs/service_<name>.{stdout,stderr}.log`
+  with 100MB rotation.
+- Sets these env vars: `PYTHONPATH`, `PYTHONUNBUFFERED`,
+  `KALSHI_API_KEY_PATH`, `KALSHI_ENGINE_WAREHOUSE`, and
+  `ALPACA_CREDENTIALS_PATH` (INXU services only).
+
+**Install (services created in STOPPED state)** - run from elevated PowerShell:
+
+```powershell
+# Dry-run first to inspect what would happen
+.\scripts\install_services.ps1 -DryRun
+
+# When satisfied:
+.\scripts\install_services.ps1
+```
+
+**Start the services in safe boot order** (observers first, then INXU
+shim with smallest exposure, then 15m and 1hr engines):
+
+```powershell
+.\scripts\start_services.ps1
+```
+
+This prompts for confirmation before placing any real-money services
+into running state. Use `-SkipConfirm` to bypass in automation.
+
+**Verify**:
+
+```powershell
+Get-Service Kalshi*
+Get-Content D:\Trading\warehouse\raw\live_logs\live_favorite_chase_v2_kalshi_engine.jsonl -Tail 5
+Get-Content D:\Trading\warehouse\raw\live_logs\live_hourglass_trader.jsonl -Tail 5
+```
+
+Each service's boot envelope should appear in the log within 30
+seconds of starting.
+
+**Uninstall** (stops + removes the 5 services; leaves logs intact):
+
+```powershell
+.\scripts\uninstall_services.ps1
+```
+
+`KalshiCapture` is never touched by these scripts - it's a pre-existing
+service that should remain running independently.
+
+### Editing service configuration
+
+To change a service's args (e.g., adjust `--daily-cap-cents`) without
+reinstalling from scratch:
+
+```powershell
+nssm edit KalshiEngine1hr      # GUI editor for one service
+```
+
+Or non-interactively:
+
+```powershell
+nssm set KalshiEngine1hr AppParameters "<new args string>"
+nssm restart KalshiEngine1hr
+```
+
+The full args string is logged in the install script for reference.
+
+### Diagnostic gap to be aware of
+
+The engines write to JSONL files only on events. During quiet periods
+(after-hours for INXU, low-activity windows for crypto), logs go silent
+for minutes-to-hours regardless of process state. **Do not assume "log
+went quiet" means "process died"** - check `Get-Service Kalshi*` or the
+NSSM-rotated `.stdout.log` file's mtime for proof-of-life.
+
+A future patch will add a periodic `heartbeat` JSONL event (~30 LOC
+per engine) so process state is unambiguous from the logs.
