@@ -118,7 +118,7 @@ $Services = @(
     @{
         Name = "KalshiEngine1hr"
         DisplayName = "Kalshi Engine - 1hr (Phase 14.9 BTC d_norm + 14.12 ladder)"
-        Description = "Live 1hr engine (real money). BTC d_norm danger-zone gate, ETH 1to3 ramp, T+30/40/50 triggers. Daily cap `$10. Phase 14.12 BTC ladder companion at T+30 (3 rungs, d_norm>=1.5, 3ct each, `$5/day cap)."
+        Description = "Live 1hr engine (real money). BTC d_norm close-strike gate, ETH 1to3 ramp, T+15/30/40/55 triggers. Daily cap `$10. Phase 14.12 BTC ladder companion at T+30 (3 rungs, d_norm>=1.5, 3ct each, `$5/day cap)."
         Module = "kalshi_engine.bin.live_1hr"
         Args = @(
             "--strategy", "favorite_chase",
@@ -131,10 +131,15 @@ $Services = @(
             "--max-contracts", "10",
             "--max-favorite-cost-decicents", "920",
             "--daily-cap-cents", "1000",
-            "--trigger-minutes", "30,40,50",
+            "--trigger-minutes", "15,30,40,55",
             "--skip-hours", "13",
             "--spot-source", "bitstamp",
+            "--min-entry-d-norm", "1.5",
+            "--near-strike-allowed-minute", "55",
             "--stop-mode", "none",
+            "--shadow-stop-audit", "enabled",
+            "--shadow-stop-bid-decicents", "650",
+            "--shadow-stop-min-age-sec", "60",
             "--bps-gate", "enabled",
             # Phase 14.12 ladder (BTC only, 3 rungs, $5/day)
             "--ladder-enabled", "true",
@@ -147,6 +152,20 @@ $Services = @(
             "--ladder-daily-cap-cents", "500",
             "--ladder-cryptos", "BTC",
             "--ladder-trigger-minute", "30",
+            # Conservative live forward test: early-cycle deep ITM sweeper
+            # uses its own $3/day cap and 1ct rungs. It attaches the selected
+            # ask as the order limit so the 99c IOC default cannot overpay.
+            "--deep-itm-enabled", "true",
+            "--deep-itm-trigger-minutes", "5,10",
+            "--deep-itm-skip-trigger-minutes", "20,25",
+            "--deep-itm-cryptos", "BTC,ETH",
+            "--deep-itm-max-rungs", "2",
+            "--deep-itm-rung-size", "1",
+            "--deep-itm-min-d-norm", "3.0",
+            "--deep-itm-min-ask-dc", "900",
+            "--deep-itm-max-ask-dc", "970",
+            "--deep-itm-min-bid-size", "5",
+            "--deep-itm-daily-cap-cents", "300",
             "--log-path", "$LogDir\live_hourglass_trader.jsonl"
         )
         Env = $CommonEnv

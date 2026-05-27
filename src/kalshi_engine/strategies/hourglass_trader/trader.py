@@ -79,6 +79,8 @@ class HourglassTraderStrategy:
         max_contracts: int = 3,
         per_crypto_max_contracts: dict[str, int] | None = None,
         per_crypto_models: dict[str, Phase4CutpointsModel] | None = None,
+        min_entry_d_norm: float = 0.0,
+        near_strike_allowed_minute: int = 55,
     ) -> None:
         if log_writer is None:
             raise ValueError("HourglassTraderStrategy requires a log_writer")
@@ -92,6 +94,8 @@ class HourglassTraderStrategy:
         self.skip_hours_utc = frozenset(int(h) for h in skip_hours_utc)
         self.max_favorite_cost_decicents = int(max_favorite_cost_decicents)
         self.max_contracts = int(max_contracts)
+        self.min_entry_d_norm = float(min_entry_d_norm)
+        self.near_strike_allowed_minute = int(near_strike_allowed_minute)
         # Phase 13.6 — per-crypto sizing overrides. Values clip BEFORE the
         # global max_contracts ceiling. Missing crypto => use global cap.
         # Example: {"ETH": 1} caps ETH at 1ct while leaving BTC/SOL/etc. at
@@ -122,9 +126,12 @@ class HourglassTraderStrategy:
         # implementation since the math is identical for 1hr cycles — the only
         # thing that changes is τ (= close - now).
         self._states: dict[str, FavoriteChaseState] = {}
-        # Per-ticker: True iff we've already ENTERED this cycle. Dedup is
+        # Per-ticker: True iff we've already ENTERED this ticker. Dedup is
         # at-most-once-per-ticker regardless of how many trigger windows fire.
         self._entered: set[str] = set()
+        # Per crypto/cycle: the main trader is a single-strike selector. The
+        # ladder strategy is the only component allowed to fan out rungs.
+        self._entered_cycles: set[tuple[str, int]] = set()
         # Per-ticker per-window: True iff we've already EVALUATED that window.
         # Distinct from _entered: a SKIP at T+30 still consumes the window.
         self._evaluated: dict[str, set[int]] = {}
@@ -166,6 +173,13 @@ class HourglassTraderStrategy:
             # (tickers are per-cycle in Kalshi's KX{C}D series so this is
             # belt-and-suspenders).
             self._entered.discard(event.ticker)
+            meta = self.markets.get(event.ticker)
+            if meta is not None:
+                try:
+                    crypto = crypto_of_ticker(event.ticker)
+                    self._entered_cycles.discard((crypto.upper(), meta.open_ms))
+                except Exception:
+                    pass
             self._evaluated.pop(event.ticker, None)
             return None
         return None
@@ -212,6 +226,8 @@ class HourglassTraderStrategy:
             "skip_hours_utc": sorted(self.skip_hours_utc),
             "max_favorite_cost_decicents": self.max_favorite_cost_decicents,
             "max_contracts": self.max_contracts,
+            "min_entry_d_norm": self.min_entry_d_norm,
+            "near_strike_allowed_minute": self.near_strike_allowed_minute,
         }
 
         # Hour-skip filter — sweep flagged 13Z catastrophic.
@@ -248,6 +264,14 @@ class HourglassTraderStrategy:
                 f"could not determine crypto for ticker {book.ticker}",
                 diag_base,
             )
+        cycle_key = (crypto.upper(), meta.open_ms)
+        if cycle_key in self._entered_cycles:
+            return self._skip_decision(
+                book.ticker, fav_side,
+                f"main trader already entered {crypto.upper()} cycle "
+                f"open_ms={meta.open_ms}",
+                diag_base,
+            )
         state = self._state(crypto)
         # Phase 14.3 — per-crypto align-mode override. Use a crypto-specific
         # model if one was registered; else fall back to the global model.
@@ -261,6 +285,36 @@ class HourglassTraderStrategy:
             now_ms=book.recv_ms,
             close_ms=meta.close_ms,
         )
+
+        if (decision.action == Action.ENTER
+                and self.min_entry_d_norm > 0
+                and window_min < self.near_strike_allowed_minute):
+            d_norm = (decision.diagnostics or {}).get("d_norm")
+            if d_norm is None:
+                return self._skip_decision(
+                    book.ticker, fav_side,
+                    f"d_norm unavailable before T+{self.near_strike_allowed_minute}; "
+                    "near-strike gate fail-closed",
+                    {**diag_base, **(decision.diagnostics or {})},
+                )
+            try:
+                d_norm_value = float(d_norm)
+            except (TypeError, ValueError):
+                return self._skip_decision(
+                    book.ticker, fav_side,
+                    f"invalid d_norm={d_norm!r} before "
+                    f"T+{self.near_strike_allowed_minute}; near-strike gate "
+                    "fail-closed",
+                    {**diag_base, **(decision.diagnostics or {})},
+                )
+            if d_norm_value < self.min_entry_d_norm:
+                return self._skip_decision(
+                    book.ticker, fav_side,
+                    f"d_norm {d_norm_value:.3f} < {self.min_entry_d_norm:.3f} "
+                    f"before T+{self.near_strike_allowed_minute}; "
+                    "too close to strike",
+                    {**diag_base, **(decision.diagnostics or {})},
+                )
 
         # Per-crypto cap (Phase 13.6) applied BEFORE the global ceiling.
         if decision.action == Action.ENTER:
@@ -278,6 +332,7 @@ class HourglassTraderStrategy:
         # within the same window doesn't double-fire.
         if decision.action == Action.ENTER:
             self._entered.add(book.ticker)
+            self._entered_cycles.add(cycle_key)
 
         # Trader-specific diagnostics merge with whatever the model produced.
         if decision.diagnostics is None:

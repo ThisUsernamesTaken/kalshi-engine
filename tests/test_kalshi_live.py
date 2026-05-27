@@ -50,6 +50,14 @@ def _enter(ticker="KXBTC15M-T", side=Side.NO, size=1) -> Decision:
     )
 
 
+def _enter_with_limit(limit_price_decicents: int) -> Decision:
+    return Decision(
+        ticker="KXBTCD-T", action=Action.ENTER, side=Side.YES,
+        size=1, confidence=0.8, reason="limited signal",
+        diagnostics={"limit_price_decicents": limit_price_decicents},
+    )
+
+
 def test_construction_rejects_stop_mode_price(tmp_path):
     log = LiveLogWriter(str(tmp_path / "log.jsonl"))
     with pytest.raises(ValueError, match="stop_mode"):
@@ -85,6 +93,14 @@ async def test_enter_decision_places_order(tmp_path):
     # filled -> open_positions populated
     assert exe.open_positions["KXBTC15M-T"]["count"] == 1
     assert exe.open_positions["KXBTC15M-T"]["side"] == "no"
+
+
+async def test_enter_decision_can_attach_lower_buy_limit(tmp_path):
+    log = LiveLogWriter(str(tmp_path / "log.jsonl"))
+    client = _MockClient(place_return={"order_id": "abc", "filled_count": 1})
+    exe = LiveExecution(client, log, dry_run=False)
+    await exe.submit(_enter_with_limit(970))
+    assert client.placed[0]["price_decicents"] == 970
 
 
 async def test_skip_decision_is_a_noop(tmp_path):

@@ -70,6 +70,8 @@ def _make_strategy(
     skip_hours_utc=(13,),
     max_favorite_cost_decicents=920,
     max_contracts=3,
+    min_entry_d_norm=0.0,
+    near_strike_allowed_minute=55,
 ):
     log = _make_log()
     model = _make_model(align_mode)
@@ -79,6 +81,8 @@ def _make_strategy(
         skip_hours_utc=skip_hours_utc,
         max_favorite_cost_decicents=max_favorite_cost_decicents,
         max_contracts=max_contracts,
+        min_entry_d_norm=min_entry_d_norm,
+        near_strike_allowed_minute=near_strike_allowed_minute,
     )
     return strat, log
 
@@ -275,6 +279,38 @@ def test_one_entry_per_ticker_per_cycle():
     assert d2 is None  # dedup blocks the second evaluation
 
 
+def test_one_main_entry_per_crypto_cycle_across_strikes():
+    """After one BTC hourly entry, other BTC strikes in that cycle are skipped."""
+    s, _ = _make_strategy()
+    open_ms = 1_700_000_000_000
+    s.register_market("KXBTCD-CYC-T100000", strike=100_000.0,
+                       open_ms=open_ms, close_ms=open_ms + 3_600_000)
+    s.register_market("KXBTCD-CYC-T100100", strike=100_100.0,
+                       open_ms=open_ms, close_ms=open_ms + 3_600_000)
+    s._model = MagicMock()
+    s._model.evaluate = MagicMock(return_value=Decision(
+        ticker="KXBTCD-CYC-T100000", action=Action.ENTER, side=Side.NO,
+        size=3, confidence=0.9, reason="forced ENTER", diagnostics={},
+    ))
+
+    first = _make_book(
+        ticker="KXBTCD-CYC-T100000", cycle_open_ms=open_ms, elapsed_min=30.0,
+        yes_bid=180, yes_ask=200, no_bid=800, no_ask=820,
+    )
+    second = _make_book(
+        ticker="KXBTCD-CYC-T100100", cycle_open_ms=open_ms, elapsed_min=50.0,
+        yes_bid=180, yes_ask=200, no_bid=800, no_ask=820,
+    )
+    d1 = s.on_event(first)
+    d2 = s.on_event(second)
+    assert d1 is not None
+    assert d1.action is Action.ENTER
+    assert d2 is not None
+    assert d2.action is Action.SKIP
+    assert "already entered BTC cycle" in d2.reason
+    assert s._model.evaluate.call_count == 1
+
+
 def test_one_evaluation_per_window():
     """A second book event within the SAME T+30 window doesn't re-evaluate."""
     s, log = _make_strategy()
@@ -299,6 +335,10 @@ def test_settlement_clears_dedup_state():
     """SettlementEvent for a ticker clears its _entered / _evaluated state."""
     s, _ = _make_strategy()
     s._entered.add("KXBTCD-T")
+    s._entered_cycles.add(("BTC", 1_700_000_000_000))
+    s.register_market("KXBTCD-T", strike=100_000.0,
+                       open_ms=1_700_000_000_000,
+                       close_ms=1_700_003_600_000)
     s._evaluated["KXBTCD-T"] = {30}
     ts = 1_700_000_000_000
     settle = SettlementEvent(
@@ -307,6 +347,7 @@ def test_settlement_clears_dedup_state():
     )
     s.on_event(settle)
     assert "KXBTCD-T" not in s._entered
+    assert ("BTC", 1_700_000_000_000) not in s._entered_cycles
     assert "KXBTCD-T" not in s._evaluated
 
 
@@ -333,6 +374,53 @@ def test_max_contracts_clips_oversize_decisions():
     assert d is not None
     assert d.action is Action.ENTER
     assert d.size == 3  # clipped to max_contracts
+
+
+def test_min_d_norm_blocks_close_strike_before_allowed_minute():
+    s, _ = _make_strategy(
+        trigger_minutes=(40,), min_entry_d_norm=1.5,
+        near_strike_allowed_minute=55,
+    )
+    open_ms = 1_700_000_000_000
+    s.register_market("KXBTCD-T", strike=100_000.0,
+                       open_ms=open_ms, close_ms=open_ms + 3_600_000)
+    s._model = MagicMock()
+    s._model.evaluate = MagicMock(return_value=Decision(
+        ticker="KXBTCD-T", action=Action.ENTER, side=Side.NO,
+        size=3, confidence=1.0, reason="forced close strike",
+        diagnostics={"d_norm": 1.2},
+    ))
+    book = _make_book(
+        ticker="KXBTCD-T", cycle_open_ms=open_ms, elapsed_min=40.0,
+        yes_bid=180, yes_ask=200, no_bid=800, no_ask=820,
+    )
+    d = s.on_event(book)
+    assert d is not None
+    assert d.action is Action.SKIP
+    assert "too close to strike" in d.reason
+
+
+def test_min_d_norm_allows_close_strike_at_allowed_minute():
+    s, _ = _make_strategy(
+        trigger_minutes=(55,), min_entry_d_norm=1.5,
+        near_strike_allowed_minute=55,
+    )
+    open_ms = 1_700_000_000_000
+    s.register_market("KXBTCD-T", strike=100_000.0,
+                       open_ms=open_ms, close_ms=open_ms + 3_600_000)
+    s._model = MagicMock()
+    s._model.evaluate = MagicMock(return_value=Decision(
+        ticker="KXBTCD-T", action=Action.ENTER, side=Side.NO,
+        size=3, confidence=1.0, reason="forced close strike",
+        diagnostics={"d_norm": 1.2},
+    ))
+    book = _make_book(
+        ticker="KXBTCD-T", cycle_open_ms=open_ms, elapsed_min=55.0,
+        yes_bid=180, yes_ask=200, no_bid=800, no_ask=820,
+    )
+    d = s.on_event(book)
+    assert d is not None
+    assert d.action is Action.ENTER
 
 
 # ---- favorite-side determination ---------------------------------------

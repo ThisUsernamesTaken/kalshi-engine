@@ -43,7 +43,10 @@ from kalshi_engine.risk.envelope import RiskEnvelope, RiskState
 from kalshi_engine.strategies.favorite_chase.models.phase4_cutpoints import (
     Phase4CutpointsModel,
 )
-from kalshi_engine.strategies.hourglass_ladder.ladder import LadderStrategy
+from kalshi_engine.strategies.hourglass_ladder.ladder import (
+    DeepItmSweeperStrategy,
+    LadderStrategy,
+)
 from kalshi_engine.strategies.hourglass_trader import HourglassTraderStrategy
 from kalshi_engine.warehouse.adapters import LiveLogWriter
 from kalshi_engine.warehouse.settlement import _iso_to_ms
@@ -175,7 +178,22 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="MAX_FAV_COST in decicents. Default 920 (=$0.92). "
                         "Fee-trap protection — 96%% of 1hr envelopes hit "
                         "fav~$1.00 where Kalshi taker fees eliminate edge.")
+    p.add_argument("--min-entry-d-norm", type=float, default=1.5,
+                   help="Minimum d_norm for main-trader entries before "
+                        "--near-strike-allowed-minute. Default 1.5 blocks "
+                        "close-strike entries while 20-45 minutes remain.")
+    p.add_argument("--near-strike-allowed-minute", type=int, default=55,
+                   help="Minute offset from which close-strike entries may "
+                        "be considered. Default T+55.")
     p.add_argument("--stop-mode", default="none", choices=["none", "price"])
+    p.add_argument("--shadow-stop-audit", default="enabled",
+                   choices=["enabled", "disabled"],
+                   help="Audit-only stop monitor. Logs shadow_stop_triggered "
+                        "for open positions, but never places exits.")
+    p.add_argument("--shadow-stop-bid-decicents", type=int, default=650,
+                   help="Audit-only stop threshold on the held side's bid.")
+    p.add_argument("--shadow-stop-min-age-sec", type=float, default=60.0,
+                   help="Minimum position age before a shadow stop can log.")
     p.add_argument("--bps-gate", default="enabled",
                    choices=["enabled", "disabled"])
     # Phase 14.12 - LadderStrategy companion (BTC only by default, isolated
@@ -210,6 +228,26 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "finding (88%% of additive signal is on BTC).")
     p.add_argument("--ladder-trigger-minute", type=int, default=30,
                    help="Phase 14.12 minute-into-cycle when the ladder fires.")
+    p.add_argument("--deep-itm-enabled", default="false",
+                   choices=["true", "false"],
+                   help="Conservative 1hr deep-ITM sweeper. When true, scans "
+                        "the whole strike ladder early in the cycle and buys "
+                        "favorites whose ASK is inside --deep-itm-ask-range-dc. "
+                        "Separate cap from main trader and ladder.")
+    p.add_argument("--deep-itm-trigger-minutes", default="5,10",
+                   help="Comma-separated minute marks for the deep-ITM sweep.")
+    p.add_argument("--deep-itm-skip-trigger-minutes", default="20,25",
+                   help="Minute marks explicitly disabled for deep-ITM. Kept "
+                        "as config because observer data flagged T+20/T+25.")
+    p.add_argument("--deep-itm-cryptos", default="BTC,ETH",
+                   help="Comma-separated crypto allowlist. Default BTC,ETH.")
+    p.add_argument("--deep-itm-max-rungs", type=int, default=2)
+    p.add_argument("--deep-itm-rung-size", type=int, default=1)
+    p.add_argument("--deep-itm-min-d-norm", type=float, default=3.0)
+    p.add_argument("--deep-itm-min-ask-dc", type=int, default=900)
+    p.add_argument("--deep-itm-max-ask-dc", type=int, default=970)
+    p.add_argument("--deep-itm-min-bid-size", type=int, default=5)
+    p.add_argument("--deep-itm-daily-cap-cents", type=int, default=300)
     p.add_argument("--dry-run", action="store_true",
                    help="log decisions but place no real orders")
     p.add_argument("--spot-source", default="bitstamp",
@@ -392,6 +430,63 @@ def _route(ev, strategy, risk_state, log):
     return None
 
 
+class ShadowStopAudit:
+    """Logs hypothetical stop triggers without submitting exit orders."""
+
+    def __init__(
+        self,
+        enabled: bool,
+        bid_threshold_decicents: int,
+        min_age_ms: int,
+    ) -> None:
+        self.enabled = enabled
+        self.bid_threshold_decicents = int(bid_threshold_decicents)
+        self.min_age_ms = int(min_age_ms)
+        self._triggered: set[str] = set()
+
+    def on_book(
+        self,
+        book: BookEvent,
+        open_positions: dict[str, dict],
+        log: LiveLogWriter,
+    ) -> None:
+        if not self.enabled or book.ticker in self._triggered:
+            return
+        pos = open_positions.get(book.ticker)
+        if not pos:
+            return
+        side = str(pos.get("side") or "").lower()
+        if side == "yes":
+            bid_dc = book.yes_bid
+        elif side == "no":
+            bid_dc = book.no_bid
+        else:
+            return
+        filled_at = pos.get("filled_at_ms")
+        if filled_at is None:
+            filled_at = pos.get("entered_at_ms")
+        age_ms = book.recv_ms - int(filled_at if filled_at is not None else book.recv_ms)
+        if age_ms < self.min_age_ms:
+            return
+        if bid_dc > self.bid_threshold_decicents:
+            return
+        self._triggered.add(book.ticker)
+        log.write({
+            "kind": "shadow_stop_triggered",
+            "ticker": book.ticker,
+            "side": side,
+            "count": pos.get("count"),
+            "entry_price_decicents": pos.get("entry_price_decicents"),
+            "current_bid_decicents": bid_dc,
+            "threshold_bid_decicents": self.bid_threshold_decicents,
+            "age_ms": age_ms,
+            "yes_bid": book.yes_bid,
+            "yes_ask": book.yes_ask,
+            "no_bid": book.no_bid,
+            "no_ask": book.no_ask,
+        })
+
+
 async def _run_loop(
     strategy: HourglassTraderStrategy,
     envelope: RiskEnvelope,
@@ -407,6 +502,8 @@ async def _run_loop(
     log_path: str | None = None,
     pnl_reconcile_interval_s: float = 30.0,
     ladder: "LadderStrategy | None" = None,
+    deep_itm: "DeepItmSweeperStrategy | None" = None,
+    shadow_stop: ShadowStopAudit | None = None,
 ) -> None:
     """Merge events from both feeds, route to strategy, gate, submit."""
     queue: asyncio.Queue = asyncio.Queue()
@@ -469,17 +566,24 @@ async def _run_loop(
             except asyncio.TimeoutError:
                 continue
             try:
+                if isinstance(ev, BookEvent) and shadow_stop is not None:
+                    shadow_stop.on_book(ev, execution.open_positions, log)
                 decision = _route(ev, strategy, risk_state, log)
                 # Phase 14.12 - route SAME event to ladder; it returns 0..N
                 # additional Decisions (ENTER rungs). Each is envelope-checked
                 # and submitted independently so a ladder rung being clipped
                 # by global gates doesn't kill the trader's decision.
                 ladder_decisions = ladder.on_event(ev) if ladder is not None else []
+                deep_itm_decisions = (
+                    deep_itm.on_event(ev) if deep_itm is not None else []
+                )
                 pending: list = []
                 if decision is not None:
                     pending.append(("trader", decision))
                 for d in ladder_decisions:
                     pending.append(("ladder", d))
+                for d in deep_itm_decisions:
+                    pending.append(("deep_itm", d))
                 if not pending:
                     continue
                 for source, d in pending:
@@ -567,6 +671,23 @@ async def _amain(args: argparse.Namespace) -> int:
         print("ERROR: --trigger-minutes must list at least one minute mark",
               file=sys.stderr)
         return 2
+    try:
+        deep_itm_trigger_minutes = tuple(
+            int(x.strip()) for x in args.deep_itm_trigger_minutes.split(",")
+            if x.strip()
+        )
+        deep_itm_skip_trigger_minutes = tuple(
+            int(x.strip()) for x in args.deep_itm_skip_trigger_minutes.split(",")
+            if x.strip()
+        )
+    except ValueError as exc:
+        print(f"ERROR: invalid --deep-itm trigger minute config: {exc}",
+              file=sys.stderr)
+        return 2
+    if args.deep_itm_enabled == "true" and not deep_itm_trigger_minutes:
+        print("ERROR: --deep-itm-trigger-minutes must list at least one minute",
+              file=sys.stderr)
+        return 2
     skip_hours = tuple()
     if args.skip_hours.strip():
         try:
@@ -636,6 +757,8 @@ async def _amain(args: argparse.Namespace) -> int:
         max_contracts=args.max_contracts,
         per_crypto_max_contracts=per_crypto_caps or None,
         per_crypto_models=per_crypto_models or None,
+        min_entry_d_norm=args.min_entry_d_norm,
+        near_strike_allowed_minute=args.near_strike_allowed_minute,
     )
     # Phase 14.12 - ladder companion. Shares the trader's per-crypto state +
     # market registry via lookup callable. Disabled by default.
@@ -657,12 +780,35 @@ async def _amain(args: argparse.Namespace) -> int:
         fav_max_dc=args.ladder_fav_max_dc,
         daily_cap_cents=args.ladder_daily_cap_cents,
     )
+    deep_itm_cryptos = tuple(c.strip().upper() for c in args.deep_itm_cryptos.split(",")
+                             if c.strip())
+    deep_itm = DeepItmSweeperStrategy(
+        log_writer=log,
+        per_crypto_states=strategy._states,
+        market_lookup=lambda t: strategy.markets.get(t),
+        enabled=(args.deep_itm_enabled == "true"),
+        max_rungs=args.deep_itm_max_rungs,
+        rung_size=args.deep_itm_rung_size,
+        min_d_norm=args.deep_itm_min_d_norm,
+        min_fav_ask_dc=args.deep_itm_min_ask_dc,
+        max_fav_ask_dc=args.deep_itm_max_ask_dc,
+        min_bid_size=args.deep_itm_min_bid_size,
+        trigger_minutes=deep_itm_trigger_minutes,
+        skip_trigger_minutes=deep_itm_skip_trigger_minutes,
+        crypto_allowlist=deep_itm_cryptos,
+        daily_cap_cents=args.deep_itm_daily_cap_cents,
+    )
     envelope = RiskEnvelope(
         daily_loss_cap_cents=args.daily_cap_cents,
         max_contracts_per_trade=args.max_contracts,
     )
     risk_state = RiskState()
     spot_feed = SpotFeed(cryptos, spot_source=args.spot_source)
+    shadow_stop = ShadowStopAudit(
+        enabled=(args.shadow_stop_audit == "enabled"),
+        bid_threshold_decicents=args.shadow_stop_bid_decicents,
+        min_age_ms=int(args.shadow_stop_min_age_sec * 1000),
+    )
 
     _diag("entering KalshiClient context")
     async with KalshiClient(api_key, pem_bytes) as client:
@@ -671,17 +817,38 @@ async def _amain(args: argparse.Namespace) -> int:
             client, log, dry_run=args.dry_run, stop_mode=args.stop_mode,
         )
         _diag(f"discovery start; cryptos={[c.value for c in cryptos]}")
-        markets = await _discover_1hr_markets(client, cryptos, log)
+        # Phase 14.13+ - sleep+retry on empty discovery instead of boot_abort.
+        # Kalshi has transient gap windows (~seconds to a couple of minutes)
+        # between settled and next-open 1hr cycles where only the 25h-daily
+        # markets remain in status="open"; the Phase 14.8 cycle-duration
+        # filter correctly rejects them, but the prior code then exited
+        # with code 3 and NSSM restart-throttled the service into Paused.
+        # Mirror the Phase 14.11 KXINXU sleep+retry: log a heartbeat per
+        # attempt and keep the engine alive until markets reappear.
+        retry_seconds = 60
+        retry_attempts = 0
+        while True:
+            markets = await _discover_1hr_markets(client, cryptos, log)
+            if markets:
+                break
+            retry_attempts += 1
+            log.write({
+                "kind": "no_markets_waiting",
+                "process": "hourglass_trader",
+                "retry_attempts": retry_attempts,
+                "next_retry_s": retry_seconds,
+            })
+            _diag(f"no 1hr markets discovered; retry in {retry_seconds}s "
+                  f"(attempt {retry_attempts})")
+            try:
+                await asyncio.sleep(retry_seconds)
+            except asyncio.CancelledError:
+                return 0
         _diag(f"discovery done; markets={len(markets)}")
         for m in markets:
             strategy.register_market(
                 m["ticker"], m["strike"], m["open_ms"], m["close_ms"],
             )
-        if not markets:
-            log.write({"kind": "boot_abort",
-                       "reason": "no 1hr markets discovered"})
-            print("ERROR: no 1hr markets discovered", file=sys.stderr)
-            return 3
 
         _diag("boot reconcile from /portfolio/positions ...")
         try:
@@ -731,11 +898,16 @@ async def _amain(args: argparse.Namespace) -> int:
             "skip_hours_utc": list(skip_hours),
             "max_favorite_cost_decicents": args.max_favorite_cost_decicents,
             "max_contracts": args.max_contracts,
+            "min_entry_d_norm": args.min_entry_d_norm,
+            "near_strike_allowed_minute": args.near_strike_allowed_minute,
             "per_crypto_max_contracts": per_crypto_caps,
             "per_crypto_align_mode": per_crypto_align,
             "daily_cap_cents": args.daily_cap_cents,
             "spot_source": args.spot_source,
             "stop_mode": args.stop_mode,
+            "shadow_stop_audit": args.shadow_stop_audit,
+            "shadow_stop_bid_decicents": args.shadow_stop_bid_decicents,
+            "shadow_stop_min_age_sec": args.shadow_stop_min_age_sec,
             "bps_gate": args.bps_gate,
             "dry_run": args.dry_run,
             "duration_s": args.duration_s,
@@ -752,6 +924,19 @@ async def _amain(args: argparse.Namespace) -> int:
             "ladder_crypto_allowlist": list(ladder.crypto_allowlist),
             "ladder_fav_range_dc": [ladder.fav_min_dc, ladder.fav_max_dc],
             "ladder_daily_cap_cents": ladder.daily_cap_cents,
+            "deep_itm_enabled": deep_itm.enabled,
+            "deep_itm_max_rungs": deep_itm.max_rungs,
+            "deep_itm_rung_size": deep_itm.rung_size,
+            "deep_itm_min_d_norm": deep_itm.min_d_norm,
+            "deep_itm_ask_range_dc": [
+                deep_itm.min_fav_ask_dc,
+                deep_itm.max_fav_ask_dc,
+            ],
+            "deep_itm_min_bid_size": deep_itm.min_bid_size,
+            "deep_itm_trigger_minutes": list(deep_itm.trigger_minutes),
+            "deep_itm_skip_trigger_minutes": sorted(deep_itm.skip_trigger_minutes),
+            "deep_itm_crypto_allowlist": list(deep_itm.crypto_allowlist),
+            "deep_itm_daily_cap_cents": deep_itm.daily_cap_cents,
         })
 
         _diag("constructing kalshi_ws + entering run_loop")
@@ -767,6 +952,8 @@ async def _amain(args: argparse.Namespace) -> int:
                 client=client, cryptos=cryptos,
                 log_path=str(args.log_path),
                 ladder=ladder,
+                deep_itm=deep_itm,
+                shadow_stop=shadow_stop,
             )
         finally:
             log.write({"kind": "shutdown", "process": "hourglass_trader"})

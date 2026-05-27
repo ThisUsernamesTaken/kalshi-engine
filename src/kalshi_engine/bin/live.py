@@ -38,7 +38,13 @@ from kalshi_engine.feeds.spot_ws import SpotFeed
 from kalshi_engine.research.cycle_tracker import CycleTracker
 from kalshi_engine.risk.envelope import RiskEnvelope, RiskState
 from kalshi_engine.strategies.favorite_chase.models.phase4_cutpoints import (
+    DOGE_NO_MIN_BPS_MARGIN,
+    DOGE_NO_MIN_FAV_DECICENTS,
+    DOGE_XRP_BAD_UTC_HOURS,
     Phase4CutpointsModel,
+    XRP_NO_LOW_VOL_PCT,
+    XRP_YES_HIGH_VOL_PCT,
+    XRP_YES_LATE_MINUTE,
 )
 from kalshi_engine.strategies.favorite_chase.strategy import FavoriteChaseStrategy
 from kalshi_engine.warehouse.adapters import LiveLogWriter
@@ -631,6 +637,15 @@ async def _amain(args: argparse.Namespace) -> int:
             "time_of_day_skip": args.time_of_day_skip,
             "cutpoints_version": args.cutpoints_version,
             "pre_trigger_observation": args.pre_trigger_observation,
+            "doge_xrp_contrarian_guard": {
+                "mode": "block_and_shadow",
+                "doge_no_min_fav_decicents": DOGE_NO_MIN_FAV_DECICENTS,
+                "doge_no_min_bps_margin": DOGE_NO_MIN_BPS_MARGIN,
+                "xrp_yes_late_minute": XRP_YES_LATE_MINUTE,
+                "xrp_yes_high_vol_pct": XRP_YES_HIGH_VOL_PCT,
+                "xrp_no_low_vol_pct": XRP_NO_LOW_VOL_PCT,
+                "bad_utc_hours": sorted(DOGE_XRP_BAD_UTC_HOURS),
+            },
             "markets_registered": len(markets),
             "warmup_events_drained": warmup_n,
             "log_path": str(args.log_path),

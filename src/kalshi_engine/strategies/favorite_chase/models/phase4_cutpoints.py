@@ -232,6 +232,19 @@ T6_SIZE_AT_6 = 10
 # 9 winners worth $1.93 — net +$4.49 backtest improvement.
 DOGE_BPS_FLOOR = 10.0
 
+# Phase 14.13 (DOGE/XRP contrarian guard) — live-safe version of the
+# DOGE/XRP inversion research from 2026-05-27. These regimes were negative
+# as original favorite-chase entries, with the opposite side positive on a
+# fill-row approximation. For live safety this phase BLOCKS the weak original
+# entry and stamps a shadow contrarian recommendation in diagnostics; it does
+# not place inverted orders until opposite-side liquidity is forward-tested.
+DOGE_NO_MIN_FAV_DECICENTS = 700.0
+DOGE_NO_MIN_BPS_MARGIN = 15.0
+XRP_YES_LATE_MINUTE = 45
+XRP_YES_HIGH_VOL_PCT = 0.55
+XRP_NO_LOW_VOL_PCT = 0.20
+DOGE_XRP_BAD_UTC_HOURS = frozenset([18, 20])
+
 # Phase 14.9 (V13b BTC d_norm danger-zone gate) — BTC-targeted gate built on
 # the d_norm diagnostic shipped in Phase 14.7. d_norm is the vol-normalized
 # distance to strike: bps_margin / (vol_30m * sqrt(tau_min)). The cluster
@@ -317,6 +330,7 @@ class Phase4CutpointsModel:
         spot = state.latest_spot()
         vol = state.vol_30m()
         utc_hour = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).hour
+        utc_minute = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).minute
         diag: dict = {
             "ticker": ticker,
             "side": side.value,
@@ -325,6 +339,7 @@ class Phase4CutpointsModel:
             "spot": spot,
             "vol_30m": vol,
             "utc_hour": utc_hour,
+            "utc_minute": utc_minute,
             "time_of_day_skip_enabled": self.time_of_day_skip,
         }
         # Phase 12.5 — Rec 2: time-of-day SKIP gate (US-AM weak window).
@@ -412,6 +427,18 @@ class Phase4CutpointsModel:
                 ticker, side,
                 f"DOGE bps_margin {bps_margin:.2f} < per-crypto floor "
                 f"{DOGE_BPS_FLOOR:.1f}", diag)
+        contrarian_skip = self._doge_xrp_contrarian_guard(
+            crypto=state.crypto,
+            side=side,
+            favorite_mid_decicents=favorite_mid_decicents,
+            bps_margin=bps_margin,
+            vol_pct=vol_pct,
+            utc_hour=utc_hour,
+            utc_minute=utc_minute,
+            diag=diag,
+        )
+        if contrarian_skip is not None:
+            return contrarian_skip
 
         # ---- sizing: depends on align_mode ----
         if self.align_mode == "2tier":
@@ -990,3 +1017,78 @@ class Phase4CutpointsModel:
         return Decision(
             ticker=ticker, action=Action.SKIP, side=side, size=0,
             confidence=0.0, reason=f"SKIP: {why}", diagnostics=diag)
+
+    def _doge_xrp_contrarian_guard(
+        self,
+        *,
+        crypto: str,
+        side: Side,
+        favorite_mid_decicents: float,
+        bps_margin: float,
+        vol_pct: float,
+        utc_hour: int,
+        utc_minute: int,
+        diag: dict,
+    ) -> Decision | None:
+        if crypto not in {"DOGE", "XRP"}:
+            return None
+
+        reasons: list[str] = []
+        if utc_hour in DOGE_XRP_BAD_UTC_HOURS:
+            reasons.append(
+                f"{crypto} UTC hour {utc_hour:02d}Z in "
+                f"{sorted(DOGE_XRP_BAD_UTC_HOURS)} weak window"
+            )
+
+        if crypto == "DOGE" and side is Side.NO:
+            if favorite_mid_decicents < DOGE_NO_MIN_FAV_DECICENTS:
+                reasons.append(
+                    f"DOGE NO favorite_mid {favorite_mid_decicents:.0f} < "
+                    f"{DOGE_NO_MIN_FAV_DECICENTS:.0f}"
+                )
+            if bps_margin < DOGE_NO_MIN_BPS_MARGIN:
+                reasons.append(
+                    f"DOGE NO bps_margin {bps_margin:.2f} < "
+                    f"{DOGE_NO_MIN_BPS_MARGIN:.1f}"
+                )
+
+        if crypto == "XRP" and side is Side.YES:
+            if (utc_minute >= XRP_YES_LATE_MINUTE
+                    and vol_pct >= XRP_YES_HIGH_VOL_PCT):
+                reasons.append(
+                    f"XRP YES late/high-vol minute={utc_minute:02d} >= "
+                    f"{XRP_YES_LATE_MINUTE} and vol_pct={vol_pct:.2f} >= "
+                    f"{XRP_YES_HIGH_VOL_PCT:.2f}"
+                )
+
+        if crypto == "XRP" and side is Side.NO:
+            if vol_pct <= XRP_NO_LOW_VOL_PCT:
+                reasons.append(
+                    f"XRP NO low-vol vol_pct={vol_pct:.2f} <= "
+                    f"{XRP_NO_LOW_VOL_PCT:.2f}"
+                )
+
+        if not reasons:
+            return None
+
+        contrarian_side = Side.NO if side is Side.YES else Side.YES
+        diag.update({
+            "doge_xrp_contrarian_guard": True,
+            "contrarian_shadow_enabled": True,
+            "contrarian_shadow_side": contrarian_side.value,
+            "contrarian_guard_reasons": reasons,
+            "doge_no_min_fav_decicents": DOGE_NO_MIN_FAV_DECICENTS,
+            "doge_no_min_bps_margin": DOGE_NO_MIN_BPS_MARGIN,
+            "xrp_yes_late_minute": XRP_YES_LATE_MINUTE,
+            "xrp_yes_high_vol_pct": XRP_YES_HIGH_VOL_PCT,
+            "xrp_no_low_vol_pct": XRP_NO_LOW_VOL_PCT,
+            "doge_xrp_bad_utc_hours": sorted(DOGE_XRP_BAD_UTC_HOURS),
+        })
+        return self._skip(
+            diag["ticker"],
+            side,
+            "DOGE/XRP contrarian guard: "
+            + "; ".join(reasons)
+            + f"; shadow opposite={contrarian_side.value}",
+            diag,
+        )

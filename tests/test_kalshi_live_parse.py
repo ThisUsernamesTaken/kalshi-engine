@@ -16,7 +16,11 @@ import pytest
 
 from kalshi_engine.core.interfaces import Decision
 from kalshi_engine.core.types import Action, Side
-from kalshi_engine.execution.kalshi_live import LiveExecution, _safe_int_count
+from kalshi_engine.execution.kalshi_live import (
+    LiveExecution,
+    _position_entry_price_decicents,
+    _safe_int_count,
+)
 from kalshi_engine.warehouse.adapters import LiveLogWriter
 
 
@@ -46,6 +50,21 @@ def test_safe_int_count_handles_decimal_strings(value, expected):
 def test_safe_int_count_custom_default():
     assert _safe_int_count(None, default=99) == 99
     assert _safe_int_count("xx", default=-1) == -1
+
+
+@pytest.mark.parametrize(
+    "payload,expected",
+    [
+        ({"side": "yes", "yes_price_dollars": "0.87"}, 870),
+        ({"side": "no", "yes_price_dollars": "0.13"}, 870),
+        ({"purchased_side": "no", "yes_price_dollars": "0.22"}, 780),
+        ({"side": "yes", "yes_price": "0.91"}, 910),
+        ({"side": "no"}, None),
+        ({"side": "maybe", "yes_price_dollars": "0.50"}, None),
+    ],
+)
+def test_position_entry_price_decicents(payload, expected):
+    assert _position_entry_price_decicents(payload) == expected
 
 
 # ---- LiveExecution mocks --------------------------------------------------
@@ -103,6 +122,20 @@ def test_filled_count_decimal_string_does_not_crash(tmp_path):
     kinds = [e["kind"] for e in events]
     assert "order_filled" in kinds
     assert "order_parse_error" not in kinds
+
+
+def test_entry_price_stored_from_order_response(tmp_path):
+    """Stored entry price supports shadow-stop audits without rereading fills."""
+    log = LiveLogWriter(str(tmp_path / "live.jsonl"))
+    client = _FakeClient(order_response={
+        "filled_count": "1.00",
+        "order_id": "ord_test_abc",
+        "side": "no",
+        "yes_price_dollars": "0.12",
+    })
+    exec_ = LiveExecution(client, log)
+    asyncio.run(exec_.submit(_enter(side=Side.NO)))
+    assert exec_.open_positions["KXBTC15M-T"]["entry_price_decicents"] == 880
 
 
 def test_filled_count_zero_does_not_book_position(tmp_path):

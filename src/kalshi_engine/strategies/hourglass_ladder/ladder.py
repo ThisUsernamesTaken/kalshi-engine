@@ -363,3 +363,278 @@ class LadderStrategy:
         """Kalshi taker fee per contract: ceil(7 * c * (1-c)) cents."""
         c = max(0.0, min(1.0, cost_dollars))
         return math.ceil(7 * c * (1 - c))
+
+
+class DeepItmSweeperStrategy:
+    """Conservative 1hr deep-ITM sweep.
+
+    This is deliberately separate from LadderStrategy. LadderStrategy ranks
+    far strikes by d_norm at one trigger time and uses favorite mid. The deep
+    ITM sweeper is a price-band strategy: scan the whole cycle ladder early,
+    buy only favorites with current ask inside a configured band, attach that
+    ask as the live limit price, and fire once per crypto/cycle.
+    """
+
+    _WINDOW_HALF_S = 30
+
+    def __init__(
+        self,
+        log_writer,
+        per_crypto_states: dict[str, FavoriteChaseState] | None = None,
+        market_lookup=None,
+        *,
+        enabled: bool = False,
+        max_rungs: int = 2,
+        rung_size: int = 1,
+        min_d_norm: float = 3.0,
+        min_fav_ask_dc: int = 900,
+        max_fav_ask_dc: int = 970,
+        min_bid_size: int = 5,
+        trigger_minutes: tuple[int, ...] = (5, 10),
+        skip_trigger_minutes: tuple[int, ...] = (20, 25),
+        crypto_allowlist: tuple[str, ...] = ("BTC", "ETH"),
+        daily_cap_cents: int = 300,
+    ) -> None:
+        if log_writer is None:
+            raise ValueError("DeepItmSweeperStrategy requires a log_writer")
+        if max_rungs < 1:
+            raise ValueError(f"max_rungs must be >= 1, got {max_rungs}")
+        if rung_size < 1:
+            raise ValueError(f"rung_size must be >= 1, got {rung_size}")
+        if min_fav_ask_dc > max_fav_ask_dc:
+            raise ValueError("min_fav_ask_dc must be <= max_fav_ask_dc")
+        self._log = log_writer
+        self._states = per_crypto_states if per_crypto_states is not None else {}
+        self._market_lookup = market_lookup or (lambda t: None)
+        self.enabled = bool(enabled)
+        self.max_rungs = int(max_rungs)
+        self.rung_size = int(rung_size)
+        self.min_d_norm = float(min_d_norm)
+        self.min_fav_ask_dc = int(min_fav_ask_dc)
+        self.max_fav_ask_dc = int(max_fav_ask_dc)
+        self.min_bid_size = int(min_bid_size)
+        self.trigger_minutes = tuple(int(m) for m in trigger_minutes)
+        self.skip_trigger_minutes = frozenset(int(m) for m in skip_trigger_minutes)
+        self.crypto_allowlist = tuple(c.upper() for c in crypto_allowlist)
+        self.daily_cap_cents = int(daily_cap_cents)
+        self._latest_book: dict[str, BookEvent] = {}
+        self._fired_cycles: set[tuple[str, int]] = set()
+        self._open_positions: dict[str, LadderRungEntry] = {}
+        self._daily_realized_cents: int = 0
+        self._daily_utc_date: str | None = None
+
+    def _check_daily_reset(self, now_ms: int) -> None:
+        today = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).date().isoformat()
+        if self._daily_utc_date != today:
+            self._daily_utc_date = today
+            self._daily_realized_cents = 0
+
+    def daily_cap_bound(self, now_ms: int) -> bool:
+        self._check_daily_reset(now_ms)
+        return self._daily_realized_cents <= -abs(self.daily_cap_cents)
+
+    def on_event(self, event) -> list[Decision]:
+        if not self.enabled:
+            return []
+        if isinstance(event, BookEvent):
+            self._latest_book[event.ticker] = event
+            return self._maybe_fire(event)
+        if isinstance(event, SettlementEvent):
+            self._handle_settlement(event)
+        return []
+
+    def _handle_settlement(self, ev: SettlementEvent) -> None:
+        entry = self._open_positions.pop(ev.ticker, None)
+        if entry is None:
+            return
+        result_val = ev.result.value if hasattr(ev.result, "value") else str(ev.result)
+        win = entry.side == result_val
+        payout_cents = 100 if win else 0
+        entry_cents = entry.entry_dc / 10.0
+        fee_cents = LadderStrategy._fee_cents(entry.entry_dc / 1000.0)
+        realized = (payout_cents - entry_cents - fee_cents) * entry.size
+        realized_int = int(realized) if realized >= 0 else -int(-realized + 0.5)
+        ts_ms = ev.ts_ms if hasattr(ev, "ts_ms") and ev.ts_ms else int(
+            datetime.now(tz=timezone.utc).timestamp() * 1000)
+        self._check_daily_reset(ts_ms)
+        self._daily_realized_cents += realized_int
+        self._log.write({
+            "kind": "deep_itm_settlement",
+            "ticker": ev.ticker,
+            "side": entry.side,
+            "result": result_val,
+            "win": win,
+            "entry_dc": entry.entry_dc,
+            "size": entry.size,
+            "realized_cents": realized_int,
+            "daily_realized_cents": self._daily_realized_cents,
+            "daily_cap_cents": self.daily_cap_cents,
+            "daily_cap_bound": self.daily_cap_bound(ts_ms),
+        })
+
+    def _maybe_fire(self, book: BookEvent) -> list[Decision]:
+        meta = self._market_lookup(book.ticker)
+        if meta is None:
+            return []
+        elapsed_min = (book.recv_ms - meta.open_ms) / 60_000.0
+        window_min = None
+        for trigger_minute in self.trigger_minutes:
+            hi = trigger_minute + (self._WINDOW_HALF_S / 60.0)
+            if trigger_minute <= elapsed_min < hi:
+                window_min = trigger_minute
+                break
+        if window_min is None or window_min in self.skip_trigger_minutes:
+            return []
+        try:
+            crypto = crypto_of_ticker(book.ticker).upper()
+        except Exception:
+            return []
+        if crypto not in self.crypto_allowlist:
+            return []
+        cycle_key = (crypto, int(meta.open_ms))
+        if cycle_key in self._fired_cycles:
+            return []
+        if self.daily_cap_bound(book.recv_ms):
+            self._fired_cycles.add(cycle_key)
+            self._log.write({
+                "kind": "deep_itm_decision",
+                "ticker": book.ticker,
+                "cycle_open_ms": int(meta.open_ms),
+                "action": "skip_cap_bound",
+                "daily_realized_cents": self._daily_realized_cents,
+                "daily_cap_cents": self.daily_cap_cents,
+            })
+            return []
+        state = self._states.get(crypto)
+        if state is None:
+            return []
+        spot = state.latest_spot()
+        vol = state.vol_30m()
+        if spot is None or vol is None or vol <= 0:
+            return []
+
+        self._fired_cycles.add(cycle_key)
+        candidates = []
+        for ticker, cached_book in self._latest_book.items():
+            candidate_meta = self._market_lookup(ticker)
+            if candidate_meta is None or int(candidate_meta.open_ms) != int(meta.open_ms):
+                continue
+            try:
+                candidate_crypto = crypto_of_ticker(ticker).upper()
+            except Exception:
+                continue
+            if candidate_crypto != crypto:
+                continue
+
+            yes_mid = (cached_book.yes_bid + cached_book.yes_ask) / 2.0
+            no_mid = (cached_book.no_bid + cached_book.no_ask) / 2.0
+            if yes_mid >= no_mid:
+                fav_side = Side.YES
+                fav_ask_dc = cached_book.yes_ask
+                exit_bid_size = (
+                    cached_book.yes_levels[0][1] if cached_book.yes_levels else None
+                )
+            else:
+                fav_side = Side.NO
+                fav_ask_dc = cached_book.no_ask
+                exit_bid_size = (
+                    cached_book.no_levels[0][1] if cached_book.no_levels else None
+                )
+            if not (self.min_fav_ask_dc <= fav_ask_dc <= self.max_fav_ask_dc):
+                continue
+            if exit_bid_size is not None and exit_bid_size < self.min_bid_size:
+                continue
+            tau_min = (candidate_meta.close_ms - cached_book.recv_ms) / 60_000.0
+            if tau_min <= 0:
+                continue
+            bps_margin = abs(spot - candidate_meta.strike) / spot * 1e4
+            d_norm = bps_margin / (vol * math.sqrt(tau_min))
+            if d_norm < self.min_d_norm:
+                continue
+            candidates.append({
+                "ticker": ticker,
+                "side": fav_side,
+                "fav_ask_dc": fav_ask_dc,
+                "exit_bid_size": exit_bid_size,
+                "d_norm": d_norm,
+                "strike": candidate_meta.strike,
+                "tau_min": tau_min,
+                "bps_margin": bps_margin,
+            })
+
+        candidates.sort(key=lambda r: (r["fav_ask_dc"], -r["d_norm"]))
+        chosen = candidates[:self.max_rungs]
+        decisions: list[Decision] = []
+        for rank, row in enumerate(chosen, start=1):
+            diag = {
+                "ticker": row["ticker"],
+                "side": row["side"].value,
+                "favorite_ask_decicents": row["fav_ask_dc"],
+                "limit_price_decicents": row["fav_ask_dc"],
+                "strike": row["strike"],
+                "d_norm": row["d_norm"],
+                "bps_margin": row["bps_margin"],
+                "tau_min": row["tau_min"],
+                "exit_bid_size_top": row["exit_bid_size"],
+                "cycle_open_ms": int(meta.open_ms),
+                "window_label": f"T+{window_min}",
+                "deep_itm_max_rungs": self.max_rungs,
+                "deep_itm_rung_size": self.rung_size,
+                "deep_itm_min_d_norm": self.min_d_norm,
+                "deep_itm_ask_range_dc": [
+                    self.min_fav_ask_dc,
+                    self.max_fav_ask_dc,
+                ],
+                "deep_itm_strategy": "deep_itm_sweeper",
+            }
+            decision = Decision(
+                ticker=row["ticker"],
+                action=Action.ENTER,
+                side=row["side"],
+                size=self.rung_size,
+                confidence=min(1.0, row["d_norm"] / 6.0),
+                reason=(
+                    f"DEEP_ITM_SWEEP T+{window_min} ask={row['fav_ask_dc']}dc "
+                    f"d_norm={row['d_norm']:.2f} -> {self.rung_size}ct "
+                    f"limit={row['fav_ask_dc']}dc"
+                ),
+                diagnostics=diag,
+            )
+            decisions.append(decision)
+            self._open_positions[row["ticker"]] = LadderRungEntry(
+                ticker=row["ticker"],
+                side=row["side"].value,
+                entry_dc=row["fav_ask_dc"],
+                size=self.rung_size,
+            )
+            self._log.write({
+                "kind": "deep_itm_decision",
+                "ticker": row["ticker"],
+                "cycle_open_ms": int(meta.open_ms),
+                "action": "enter",
+                "side": row["side"].value,
+                "size": self.rung_size,
+                "fav_ask_dc": row["fav_ask_dc"],
+                "limit_price_decicents": row["fav_ask_dc"],
+                "d_norm": row["d_norm"],
+                "bps_margin": row["bps_margin"],
+                "exit_bid_size_top": row["exit_bid_size"],
+                "rung_rank": rank,
+                "n_candidates_total": len(candidates),
+                "n_candidates_chosen": len(chosen),
+                "daily_realized_cents": self._daily_realized_cents,
+                "daily_cap_cents": self.daily_cap_cents,
+            })
+        if not chosen:
+            self._log.write({
+                "kind": "deep_itm_decision",
+                "ticker": book.ticker,
+                "cycle_open_ms": int(meta.open_ms),
+                "action": "no_rungs",
+                "window_label": f"T+{window_min}",
+                "n_candidates_total": len(candidates),
+                "reason": "0 candidates passed ask band + d_norm + depth filters",
+                "daily_realized_cents": self._daily_realized_cents,
+                "daily_cap_cents": self.daily_cap_cents,
+            })
+        return decisions

@@ -43,6 +43,21 @@ def _safe_int_count(value: Any, default: int = 0) -> int:
         return default
 
 
+def _position_entry_price_decicents(payload: dict) -> int | None:
+    """Return the paid side price from a Kalshi fill payload, in deci-cents."""
+    side = (payload.get("side") or payload.get("purchased_side") or "").lower()
+    raw_yes_price = payload.get("yes_price_dollars") or payload.get("yes_price")
+    if side not in ("yes", "no") or raw_yes_price is None:
+        return None
+    try:
+        yes_dc = round(float(raw_yes_price) * 1000)
+    except (TypeError, ValueError):
+        return None
+    if side == "yes":
+        return yes_dc
+    return 1000 - yes_dc
+
+
 class LiveExecution:
     """Implements the Execution protocol against the live Kalshi API."""
 
@@ -71,7 +86,15 @@ class LiveExecution:
         if decision.action is Action.SKIP or decision.action is Action.HOLD:
             return
         if decision.action is Action.ENTER:
-            await self._place(decision, action="buy", price_dc=BUY_PRICE_DECICENTS)
+            price_dc = BUY_PRICE_DECICENTS
+            if isinstance(decision.diagnostics, dict):
+                raw_limit = decision.diagnostics.get("limit_price_decicents")
+                if raw_limit is not None:
+                    try:
+                        price_dc = max(1, min(BUY_PRICE_DECICENTS, int(raw_limit)))
+                    except (TypeError, ValueError):
+                        price_dc = BUY_PRICE_DECICENTS
+            await self._place(decision, action="buy", price_dc=price_dc)
         elif decision.action is Action.EXIT:
             await self._place(decision, action="sell", price_dc=SELL_PRICE_DECICENTS)
 
@@ -123,12 +146,17 @@ class LiveExecution:
             })
             return
         if action == "buy" and filled > 0:
+            entry_price_dc = _position_entry_price_decicents(order)
             self.open_positions[decision.ticker] = {
                 "side": decision.side.value,
                 "count": filled,
                 "order_id": order_id,
                 "entered_at_ms": int(time.time() * 1000),
             }
+            if entry_price_dc is not None:
+                self.open_positions[decision.ticker][
+                    "entry_price_decicents"
+                ] = entry_price_dc
             self.log.write({
                 "kind": "order_filled",
                 "ticker": decision.ticker,
@@ -251,11 +279,16 @@ class LiveExecution:
                 action = (payload.get("action") or "").lower()
                 side = (payload.get("side") or "").lower()
                 if action == "buy":
+                    entry_price_dc = _position_entry_price_decicents(payload)
                     self.open_positions[ticker] = {
                         "side": side,
                         "count": count,
                         "filled_at_ms": int(time.time() * 1000),
                     }
+                    if entry_price_dc is not None:
+                        self.open_positions[ticker][
+                            "entry_price_decicents"
+                        ] = entry_price_dc
                 elif action == "sell":
                     self.open_positions.pop(ticker, None)
             except Exception as exc:

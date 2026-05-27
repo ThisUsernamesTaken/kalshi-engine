@@ -119,6 +119,8 @@ class _InxuObserverState:
         self.observe_minutes = observe_minutes
         # (ticker, window_label) -> done flag (one-shot per cycle)
         self.fired: set[tuple[str, str]] = set()
+        # Phase 14.13 - per-ticker latest open_interest, refreshed by discovery.
+        self.oi: dict[str, float] = {}
 
     def register(self, ticker: str, strike: float, open_ms: int,
                   close_ms: int, series: str, equity: Equity) -> None:
@@ -126,6 +128,15 @@ class _InxuObserverState:
             "strike": strike, "open_ms": open_ms, "close_ms": close_ms,
             "series": series, "equity": equity,
         }
+
+    def update_open_interest(self, ticker: str, oi: float | None) -> None:
+        """Phase 14.13 - refresh per-ticker OI from REST discovery."""
+        if oi is None:
+            return
+        try:
+            self.oi[ticker] = float(oi)
+        except (TypeError, ValueError):
+            pass
 
     def window_label(self, elapsed_min: float) -> str | None:
         """Return 'T+30' / 'T+40' / 'T+50' if elapsed is within 60s of a
@@ -167,10 +178,17 @@ async def _discover_markets(client: KalshiClient, equities: list[Equity],
                            "cap_minutes": MAX_INXU_CYCLE_MIN})
                 skipped_long += 1
                 continue
+            # Phase 14.13 - extract OI for variance research.
+            oi_raw = m.get("open_interest_fp")
+            try:
+                oi = float(oi_raw) if oi_raw is not None else None
+            except (TypeError, ValueError):
+                oi = None
             out.append({
                 "ticker": ticker, "strike": strike,
                 "open_ms": open_ms, "close_ms": close_ms,
                 "series": spec.kalshi_series, "equity": eq,
+                "open_interest": oi,
             })
     counts: dict[str, int] = {}
     for m in out:
@@ -243,6 +261,22 @@ async def _handle_book(ev, state: _InxuObserverState,
         })
         state.fired.add(key)
         return
+    # Phase 14.13 - OI aggregates over the cycle's strikes. Adapt the
+    # state.markets dict-shaped values into objects the shared helper can
+    # access via attributes.
+    from kalshi_engine.strategies.hourglass_observer.observer import (
+        _cycle_oi_aggregates,
+    )
+    from types import SimpleNamespace
+    adapter_markets = {
+        tk: SimpleNamespace(open_ms=int(mv["open_ms"]),
+                             strike=float(mv["strike"]))
+        for tk, mv in state.markets.items()
+    }
+    oi_features = _cycle_oi_aggregates(
+        ev.ticker, state.oi.get(ev.ticker),
+        int(market["open_ms"]), trade.price, adapter_markets, state.oi,
+    )
     # Build pretrigger envelope mirroring book_at_1hr_pretrigger schema
     envelope = {
         "kind": "book_at_inxu_pretrigger",
@@ -262,6 +296,8 @@ async def _handle_book(ev, state: _InxuObserverState,
         "spot_ts_ms": trade.ts_ms,
         "spot_exchange": trade.exchange,
         "strike": market["strike"],
+        # Phase 14.13 OI features
+        **oi_features,
     }
     log.write(envelope)
     state.fired.add(key)
@@ -312,6 +348,7 @@ async def _amain(args: argparse.Namespace) -> int:
         for m in markets:
             state.register(m["ticker"], m["strike"], m["open_ms"],
                             m["close_ms"], m["series"], m["equity"])
+            state.update_open_interest(m["ticker"], m.get("open_interest"))
         _diag(f"registered {len(markets)} markets")
 
         log.write({
@@ -374,7 +411,16 @@ async def _discovery_loop(client: KalshiClient, equities: list,
                     continue
                 for m in markets:
                     ticker = m.get("ticker")
-                    if not ticker or ticker in state.markets:
+                    if not ticker:
+                        continue
+                    # Phase 14.13 - refresh OI for EVERY ticker, registered or new.
+                    oi_raw = m.get("open_interest_fp")
+                    try:
+                        oi_val = float(oi_raw) if oi_raw is not None else None
+                    except (TypeError, ValueError):
+                        oi_val = None
+                    state.update_open_interest(ticker, oi_val)
+                    if ticker in state.markets:
                         continue
                     strike = _strike_from_market(m)
                     open_ms = _iso_to_ms(m.get("open_time"))

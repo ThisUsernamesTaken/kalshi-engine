@@ -148,9 +148,16 @@ async def _discover_1hr_markets(
                 })
                 skipped_long += 1
                 continue
+            # Phase 14.13 - extract OI for variance research.
+            oi_raw = m.get("open_interest_fp")
+            try:
+                oi = float(oi_raw) if oi_raw is not None else None
+            except (TypeError, ValueError):
+                oi = None
             out.append({
                 "ticker": ticker, "strike": strike,
                 "open_ms": open_ms, "close_ms": close_ms, "series": series,
+                "open_interest": oi,
             })
     counts: dict[str, int] = {}
     for m in out:
@@ -181,7 +188,16 @@ async def _discovery_loop(
                     continue
                 for m in markets:
                     ticker = m.get("ticker")
-                    if not ticker or ticker in observer.markets:
+                    if not ticker:
+                        continue
+                    # Phase 14.13 - refresh OI for EVERY ticker, registered or new.
+                    oi_raw = m.get("open_interest_fp")
+                    try:
+                        oi_val = float(oi_raw) if oi_raw is not None else None
+                    except (TypeError, ValueError):
+                        oi_val = None
+                    observer.update_open_interest(ticker, oi_val)
+                    if ticker in observer.markets:
                         continue
                     strike = _strike_from_market(m)
                     open_ms = _iso_to_ms(m.get("open_time"))
@@ -318,6 +334,7 @@ async def _amain(args: argparse.Namespace) -> int:
         _diag(f"discovered {len(markets)} 1hr markets")
         for m in markets:
             observer.register_market(m["ticker"], m["strike"], m["open_ms"], m["close_ms"])
+            observer.update_open_interest(m["ticker"], m.get("open_interest"))
         if not markets:
             log.write({"kind": "boot_abort", "reason": "no_1hr_markets_discovered"})
             print("ERROR: no 1hr markets discovered", file=sys.stderr)

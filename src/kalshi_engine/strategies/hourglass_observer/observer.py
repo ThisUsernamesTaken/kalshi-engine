@@ -51,6 +51,75 @@ class HourMarketMeta:
     close_ms: int
 
 
+def _cycle_oi_aggregates(this_ticker: str, this_oi: float | None,
+                          cycle_open_ms: int, spot: float | None,
+                          markets: dict, oi_cache: dict) -> dict:
+    """Phase 14.13 - per-cycle OI aggregates computed from the cache of all
+    same-cycle strikes. Returns a dict of fields to merge into the envelope.
+    Missing values (no OI yet for a ticker) are simply omitted from the
+    cycle population - we compute aggregates over whatever subset is known.
+    """
+    cycle = []
+    for tk, meta in markets.items():
+        if int(meta.open_ms) != int(cycle_open_ms):
+            continue
+        oi = oi_cache.get(tk)
+        if oi is None:
+            continue
+        cycle.append((tk, float(meta.strike), float(oi)))
+    if not cycle:
+        return {
+            "open_interest": this_oi,
+            "oi_share": None,
+            "cycle_total_oi": None,
+            "cycle_n_strikes_with_oi": 0,
+            "cycle_oi_variance": None,
+            "cycle_oi_top_strike": None,
+            "cycle_oi_top_ticker": None,
+            "cycle_oi_concentration_gini": None,
+            "cycle_oi_top_strike_dist_bps": None,
+        }
+    total = sum(oi for _, _, oi in cycle)
+    n = len(cycle)
+    # Variance (population, since we have the full cycle population)
+    if n >= 2:
+        mean = total / n
+        variance = sum((oi - mean) ** 2 for _, _, oi in cycle) / n
+    else:
+        variance = 0.0
+    # Top strike by OI
+    cycle_sorted = sorted(cycle, key=lambda x: -x[2])
+    top_ticker, top_strike, top_oi = cycle_sorted[0]
+    # Gini concentration (0 = perfectly even, 1 = all OI on one strike)
+    if total > 0:
+        ois_sorted = sorted(oi for _, _, oi in cycle)
+        cumsum = sum((i + 1) * oi for i, oi in enumerate(ois_sorted))
+        gini = (2 * cumsum) / (n * total) - (n + 1) / n
+    else:
+        gini = None
+    # This ticker's share of the cycle total
+    if this_oi is not None and total > 0:
+        share = float(this_oi) / total
+    else:
+        share = None
+    # Distance from spot to top-OI strike (bps)
+    if spot is not None and spot > 0:
+        dist_bps = (top_strike - spot) / spot * 1e4
+    else:
+        dist_bps = None
+    return {
+        "open_interest": this_oi,
+        "oi_share": share,
+        "cycle_total_oi": total,
+        "cycle_n_strikes_with_oi": n,
+        "cycle_oi_variance": variance,
+        "cycle_oi_top_strike": top_strike,
+        "cycle_oi_top_ticker": top_ticker,
+        "cycle_oi_concentration_gini": gini,
+        "cycle_oi_top_strike_dist_bps": dist_bps,
+    }
+
+
 class HourglassObserverStrategy:
     """1hr observer — pure observability, no orders.
 
@@ -88,6 +157,9 @@ class HourglassObserverStrategy:
         # with keys bid_depth, ask_depth, spread_bps (or any subset). None
         # means liquidity fields will be omitted from envelopes.
         self._liquidity_poller = liquidity_poller
+        # Phase 14.13 - per-ticker latest open_interest (refreshed by
+        # discovery loop). Per-cycle aggregates are computed at envelope time.
+        self._oi: dict[str, float] = {}
 
     # -- registration ---------------------------------------------------------
     def register_market(self, ticker: str, strike: float,
@@ -96,6 +168,16 @@ class HourglassObserverStrategy:
             ticker, float(strike), int(open_ms), int(close_ms),
         )
         self._sampled.setdefault(ticker, set())
+
+    def update_open_interest(self, ticker: str, oi: float | None) -> None:
+        """Phase 14.13 - refresh per-ticker open_interest from REST discovery.
+        Called by the observer entrypoint each time it polls /markets."""
+        if oi is None:
+            return
+        try:
+            self._oi[ticker] = float(oi)
+        except (TypeError, ValueError):
+            pass
 
     def _state(self, crypto: str) -> FavoriteChaseState:
         if crypto not in self._states:
@@ -231,6 +313,11 @@ class HourglassObserverStrategy:
                     }
             except Exception as exc:
                 liq = {"bitstamp_poll_error": repr(exc)[:80]}
+        # Phase 14.13 - OI aggregates over the cycle's strikes.
+        oi_features = _cycle_oi_aggregates(
+            book.ticker, self._oi.get(book.ticker),
+            meta.open_ms, spot, self.markets, self._oi,
+        )
         self._log.write({
             "kind": "book_at_1hr_pretrigger",
             "ticker": book.ticker,
@@ -267,4 +354,6 @@ class HourglassObserverStrategy:
             "window_24h_low": sr.get("window_low"),
             "long_history_n": len(long_hist),
             **liq,
+            # Phase 14.13 OI features
+            **oi_features,
         })
