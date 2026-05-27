@@ -117,8 +117,8 @@ $Services = @(
     }
     @{
         Name = "KalshiEngine1hr"
-        DisplayName = "Kalshi Engine - 1hr (Phase 14.9 BTC d_norm gate)"
-        Description = "Live 1hr engine (real money). BTC d_norm danger-zone gate, ETH 1to3 ramp, T+30/40/50 triggers. Daily cap `$10."
+        DisplayName = "Kalshi Engine - 1hr (Phase 14.9 BTC d_norm + 14.12 ladder)"
+        Description = "Live 1hr engine (real money). BTC d_norm danger-zone gate, ETH 1to3 ramp, T+30/40/50 triggers. Daily cap `$10. Phase 14.12 BTC ladder companion at T+30 (3 rungs, d_norm>=1.5, 3ct each, `$5/day cap)."
         Module = "kalshi_engine.bin.live_1hr"
         Args = @(
             "--strategy", "favorite_chase",
@@ -136,6 +136,17 @@ $Services = @(
             "--spot-source", "bitstamp",
             "--stop-mode", "none",
             "--bps-gate", "enabled",
+            # Phase 14.12 ladder (BTC only, 3 rungs, $5/day)
+            "--ladder-enabled", "true",
+            "--ladder-max-rungs", "3",
+            "--ladder-d-norm-min", "1.5",
+            "--ladder-rung-size", "3",
+            "--ladder-min-bid-size", "3",
+            "--ladder-fav-min-dc", "750",
+            "--ladder-fav-max-dc", "950",
+            "--ladder-daily-cap-cents", "500",
+            "--ladder-cryptos", "BTC",
+            "--ladder-trigger-minute", "30",
             "--log-path", "$LogDir\live_hourglass_trader.jsonl"
         )
         Env = $CommonEnv

@@ -43,6 +43,7 @@ from kalshi_engine.risk.envelope import RiskEnvelope, RiskState
 from kalshi_engine.strategies.favorite_chase.models.phase4_cutpoints import (
     Phase4CutpointsModel,
 )
+from kalshi_engine.strategies.hourglass_ladder.ladder import LadderStrategy
 from kalshi_engine.strategies.hourglass_trader import HourglassTraderStrategy
 from kalshi_engine.warehouse.adapters import LiveLogWriter
 from kalshi_engine.warehouse.settlement import _iso_to_ms
@@ -177,6 +178,38 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--stop-mode", default="none", choices=["none", "price"])
     p.add_argument("--bps-gate", default="enabled",
                    choices=["enabled", "disabled"])
+    # Phase 14.12 - LadderStrategy companion (BTC only by default, isolated
+    # daily-PnL cap so it can fail without affecting the main engine).
+    p.add_argument("--ladder-enabled", default="false",
+                   choices=["true", "false"],
+                   help="Phase 14.12 BTC ladder companion. Default false. "
+                        "When true, at T+30 of each 1hr cycle picks top-N "
+                        "far-OTM strikes by d_norm and enters at flat "
+                        "rung_size ct on the favored side.")
+    p.add_argument("--ladder-max-rungs", type=int, default=3,
+                   help="Phase 14.12 max ladder rungs per cycle.")
+    p.add_argument("--ladder-d-norm-min", type=float, default=1.5,
+                   help="Phase 14.12 minimum d_norm for a ladder rung.")
+    p.add_argument("--ladder-rung-size", type=int, default=3,
+                   help="Phase 14.12 contracts per ladder rung.")
+    p.add_argument("--ladder-min-bid-size", type=int, default=3,
+                   help="Phase 14.12 favored-side top-of-book depth required "
+                        "to include a strike in the ladder candidate set.")
+    p.add_argument("--ladder-fav-min-dc", type=float, default=750.0,
+                   help="Phase 14.12 minimum favorite mid in deci-cents.")
+    p.add_argument("--ladder-fav-max-dc", type=float, default=950.0,
+                   help="Phase 14.12 maximum favorite mid in deci-cents "
+                        "(slightly above engine's 920 cap because rungs at "
+                        "0.93-0.95 are the highest-WR far-OTM zone).")
+    p.add_argument("--ladder-daily-cap-cents", type=int, default=500,
+                   help="Phase 14.12 ladder-only daily realized-loss cap "
+                        "(separate from --daily-cap-cents). Default 500 = $5.")
+    p.add_argument("--ladder-cryptos", default="BTC",
+                   help="Comma-separated allowlist of cryptos the ladder may "
+                        "trade. Default BTC only per stacking-analysis "
+                        "finding (88%% of additive signal is on BTC).")
+    p.add_argument("--ladder-trigger-minute", type=int, default=30,
+                   help="Phase 14.12 minute-into-cycle when the ladder fires.")
     p.add_argument("--dry-run", action="store_true",
                    help="log decisions but place no real orders")
     p.add_argument("--spot-source", default="bitstamp",
@@ -373,6 +406,7 @@ async def _run_loop(
     discovery_interval_s: float = 60.0,
     log_path: str | None = None,
     pnl_reconcile_interval_s: float = 30.0,
+    ladder: "LadderStrategy | None" = None,
 ) -> None:
     """Merge events from both feeds, route to strategy, gate, submit."""
     queue: asyncio.Queue = asyncio.Queue()
@@ -436,30 +470,40 @@ async def _run_loop(
                 continue
             try:
                 decision = _route(ev, strategy, risk_state, log)
-                if decision is None:
+                # Phase 14.12 - route SAME event to ladder; it returns 0..N
+                # additional Decisions (ENTER rungs). Each is envelope-checked
+                # and submitted independently so a ladder rung being clipped
+                # by global gates doesn't kill the trader's decision.
+                ladder_decisions = ladder.on_event(ev) if ladder is not None else []
+                pending: list = []
+                if decision is not None:
+                    pending.append(("trader", decision))
+                for d in ladder_decisions:
+                    pending.append(("ladder", d))
+                if not pending:
                     continue
-                decision = envelope.check(decision, risk_state)
-                # The trader already logged the decision; the envelope may have
-                # downsized/skipped it — log the final decision under a
-                # distinct kind so post-hoc analysis can compare.
-                log.write({
-                    "kind": "decision_post_envelope",
-                    "ticker": decision.ticker,
-                    "action": decision.action.value,
-                    "side": decision.side.value if decision.side else None,
-                    "size": decision.size,
-                    "confidence": decision.confidence,
-                    "reason": decision.reason,
-                })
-                await execution.submit(decision)
+                for source, d in pending:
+                    d_checked = envelope.check(d, risk_state)
+                    # The strategy already logged the decision; the envelope
+                    # may have downsized/skipped it - log under a distinct
+                    # kind so post-hoc analysis can compare.
+                    log.write({
+                        "kind": "decision_post_envelope",
+                        "source": source,
+                        "ticker": d_checked.ticker,
+                        "action": d_checked.action.value,
+                        "side": d_checked.side.value if d_checked.side else None,
+                        "size": d_checked.size,
+                        "confidence": d_checked.confidence,
+                        "reason": d_checked.reason,
+                    })
+                    await execution.submit(d_checked)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 log.write({
                     "kind": "submit_error",
                     "error": repr(exc),
-                    "ticker": getattr(decision, "ticker", None)
-                              if "decision" in dir() else None,
                 })
     finally:
         for task in (spot_task, ws_task, listener_task, discovery_task, pnl_task):
@@ -593,6 +637,26 @@ async def _amain(args: argparse.Namespace) -> int:
         per_crypto_max_contracts=per_crypto_caps or None,
         per_crypto_models=per_crypto_models or None,
     )
+    # Phase 14.12 - ladder companion. Shares the trader's per-crypto state +
+    # market registry via lookup callable. Disabled by default.
+    ladder_enabled = args.ladder_enabled.lower() == "true"
+    ladder_cryptos = tuple(c.strip().upper() for c in args.ladder_cryptos.split(",")
+                            if c.strip())
+    ladder = LadderStrategy(
+        log_writer=log,
+        per_crypto_states=strategy._states,
+        market_lookup=lambda t: strategy.markets.get(t),
+        enabled=ladder_enabled,
+        max_rungs=args.ladder_max_rungs,
+        d_norm_min=args.ladder_d_norm_min,
+        rung_size=args.ladder_rung_size,
+        min_bid_size=args.ladder_min_bid_size,
+        trigger_minute=args.ladder_trigger_minute,
+        crypto_allowlist=ladder_cryptos,
+        fav_min_dc=args.ladder_fav_min_dc,
+        fav_max_dc=args.ladder_fav_max_dc,
+        daily_cap_cents=args.ladder_daily_cap_cents,
+    )
     envelope = RiskEnvelope(
         daily_loss_cap_cents=args.daily_cap_cents,
         max_contracts_per_trade=args.max_contracts,
@@ -678,6 +742,16 @@ async def _amain(args: argparse.Namespace) -> int:
             "markets_registered": len(markets),
             "warmup_events_drained": warmup_n,
             "log_path": str(args.log_path),
+            # Phase 14.12 ladder config
+            "ladder_enabled": ladder.enabled,
+            "ladder_max_rungs": ladder.max_rungs,
+            "ladder_d_norm_min": ladder.d_norm_min,
+            "ladder_rung_size": ladder.rung_size,
+            "ladder_min_bid_size": ladder.min_bid_size,
+            "ladder_trigger_minute": ladder.trigger_minute,
+            "ladder_crypto_allowlist": list(ladder.crypto_allowlist),
+            "ladder_fav_range_dc": [ladder.fav_min_dc, ladder.fav_max_dc],
+            "ladder_daily_cap_cents": ladder.daily_cap_cents,
         })
 
         _diag("constructing kalshi_ws + entering run_loop")
@@ -692,6 +766,7 @@ async def _amain(args: argparse.Namespace) -> int:
                 duration_s=args.duration_s,
                 client=client, cryptos=cryptos,
                 log_path=str(args.log_path),
+                ladder=ladder,
             )
         finally:
             log.write({"kind": "shutdown", "process": "hourglass_trader"})
