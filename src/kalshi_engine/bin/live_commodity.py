@@ -237,6 +237,14 @@ class CommodityShim:
         self.daily_spend_total_cents = 0
         self._daily_start_utc_date: str | None = None
         self._last_status_log = 0.0
+        self.stop = asyncio.Event()   # set by a shutdown signal; loops drain promptly
+
+    async def _sleep_or_stop(self, seconds: float) -> None:
+        """Sleep, but wake immediately if a shutdown was requested."""
+        try:
+            await asyncio.wait_for(self.stop.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
 
     # -- daily reset ------------------------------------------------------
     def _check_daily_reset(self) -> None:
@@ -313,7 +321,7 @@ class CommodityShim:
             self.log.write({"kind": "spot_bootstrap", "commodity": commodity.value,
                             "symbol": spec.pyth_symbol, "bars_loaded": len(bars)})
 
-        while True:
+        while not self.stop.is_set():
             if deadline and time.time() >= deadline:
                 return
             for commodity, spec in self.specs.items():
@@ -332,7 +340,7 @@ class CommodityShim:
                                 "conf": px.conf, "conf_bps": px.conf_bps,
                                 "pyth_ts_ms": px.publish_time_ms})
             try:
-                await asyncio.sleep(self.args.spot_poll_seconds)
+                await self._sleep_or_stop(self.args.spot_poll_seconds)
             except asyncio.CancelledError:
                 return
 
@@ -489,7 +497,7 @@ class CommodityShim:
 
     async def decision_loop(self, deadline: Optional[float]) -> None:
         last_refresh = 0.0
-        while True:
+        while not self.stop.is_set():
             if deadline and time.time() >= deadline:
                 return
             now = time.time()
@@ -520,9 +528,35 @@ class CommodityShim:
                                     "error": repr(exc)})
             self._maybe_status_log()
             try:
-                await asyncio.sleep(self.args.decision_poll_seconds)
+                await self._sleep_or_stop(self.args.decision_poll_seconds)
             except asyncio.CancelledError:
                 return
+
+
+def _install_signal_handlers(shim: "CommodityShim") -> None:
+    """Request graceful shutdown on SIGINT/SIGTERM/SIGBREAK so a manual Ctrl+C
+    (or NSSM stop) drains the loops and exits cleanly. Uses the asyncio loop
+    handler where supported, falling back to ``signal.signal`` on Windows
+    (where ``add_signal_handler`` is unimplemented for the Proactor loop)."""
+    import signal as _signal
+    loop = asyncio.get_running_loop()
+
+    def _request_stop() -> None:
+        _diag("shutdown signal received; draining loops")
+        shim.stop.set()
+
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(_signal, name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except (NotImplementedError, RuntimeError, ValueError):
+            try:
+                _signal.signal(
+                    sig, lambda *_: loop.call_soon_threadsafe(_request_stop))
+            except (ValueError, OSError):
+                pass
 
 
 async def _amain(args: argparse.Namespace) -> int:
@@ -561,6 +595,7 @@ async def _amain(args: argparse.Namespace) -> int:
     async with KalshiClient(api_key, pem_bytes) as client:
         async with PythSpotPoller(max_stale_s=args.pyth_max_stale_s) as pyth:
             shim = CommodityShim(args, log, model, client, pyth, specs)
+            _install_signal_handlers(shim)
             await shim.refresh_markets()
             log.write({
                 "kind": "boot", "process": "live_commodity",
@@ -605,7 +640,11 @@ async def _amain(args: argparse.Namespace) -> int:
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    return asyncio.run(_amain(args))
+    try:
+        return asyncio.run(_amain(args))
+    except KeyboardInterrupt:
+        _diag("interrupted (Ctrl+C); shutting down cleanly")
+        return 0
 
 
 if __name__ == "__main__":
