@@ -212,3 +212,66 @@ async def test_refresh_until_markets_cancelled_returns_true(monkeypatch):
         shim, log, retry_seconds=300, process_label="live_inxu_v0",
     )
     assert cancelled is True
+
+
+# ---- Phase 14.17: overnight all-daily-markets -> empty discovery ---------
+
+@pytest.mark.asyncio
+async def test_discover_skips_all_daily_markets_returns_empty():
+    """Overnight, KXINXU discovery is dominated by 1440-min daily markets
+    that exceed MAX_INXU_CYCLE_MIN. They must all be filtered, leaving an
+    empty list -> the retry wrapper logs no_markets_waiting instead of the
+    legacy boot_abort that restart-looped under NSSM."""
+    from kalshi_engine.bin.observe_inxu import _discover_markets
+    from kalshi_engine.core.equity import Equity
+
+    log = MagicMock(); log.writes = []
+    log.write = lambda p: log.writes.append(p)
+
+    client = MagicMock()
+    async def fake_list_markets(**kwargs):
+        return [{
+            "ticker": "KXINXU-DAILY-T6000", "floor_strike": 6000.0,
+            "open_time": "2026-05-27T00:00:00Z",
+            "close_time": "2026-05-28T00:00:00Z",  # 1440 min == daily
+        }]
+    client.list_markets = fake_list_markets
+
+    out = await _discover_markets(client, [Equity.SPX], log)
+    assert out == []  # every market filtered -> empty (will trigger retry)
+    skips = [w for w in log.writes if w.get("kind") == "discovery_skip_long_cycle"]
+    assert len(skips) == 1
+    assert skips[0]["duration_minutes"] == 1440.0
+    # And crucially: no boot_abort anywhere in the path.
+    assert not any(w.get("kind") == "boot_abort" for w in log.writes)
+
+
+@pytest.mark.asyncio
+async def test_discover_with_retry_handles_all_daily_then_hourly(monkeypatch):
+    """End-to-end of the overnight->RTH transition: first discovery returns
+    empty (all daily filtered), second returns a real hourly market. Expect
+    one no_markets_waiting, one sleep, then the hourly market."""
+    from kalshi_engine.bin.observe_inxu import _discover_markets_with_retry
+
+    log = MagicMock(); log.writes = []
+    log.write = lambda p: log.writes.append(p)
+    hourly = [{"ticker": "KXINXU-H1-T6000", "strike": 6000.0, "open_ms": 0,
+               "close_ms": 60 * 60_000, "series": "KXINXU", "equity": "SPX"}]
+
+    calls = {"n": 0}
+    async def fake_discover(*a, **k):
+        calls["n"] += 1
+        return [] if calls["n"] == 1 else hourly
+    monkeypatch.setattr("kalshi_engine.bin.observe_inxu._discover_markets",
+                        fake_discover)
+    slept = []
+    async def fake_sleep(s): slept.append(s)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    result = await _discover_markets_with_retry(
+        client=MagicMock(), equities=[], log=log,
+        retry_seconds=300, process_label="inxu_observer")
+    assert result == hourly
+    assert slept == [300]
+    assert sum(1 for w in log.writes if w.get("kind") == "no_markets_waiting") == 1
+    assert not any(w.get("kind") == "boot_abort" for w in log.writes)

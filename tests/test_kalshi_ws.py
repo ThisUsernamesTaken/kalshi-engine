@@ -243,3 +243,50 @@ def test_lifecycle_open_emits_lifecycle_event():
     assert ev.open_ms == 1000 * 1000  # seconds -> ms
     assert ev.close_ms == 1900 * 1000
     assert ev.strike == 80000.0
+
+
+# ---- Phase 14.17: malformed-frame survival (OverflowError) --------------
+
+def test_ws_survives_oversized_int_delta():
+    """A delta whose size is an astronomically large int (float() raises
+    OverflowError) must be skipped, not crash the feed. Mirrors the
+    2026-05-27 'int too large to convert to float' feed_error that killed
+    the inxu_observer WS pump."""
+    feed = _feed()
+    list(feed._dispatch(_snapshot()))  # seed book (last_seq=1)
+    bad = {
+        "type": "orderbook_delta",
+        "msg": {
+            "market_ticker": "KXBTC15M-T", "seq": 2, "side": "yes",
+            "price_dollars": "0.2200", "delta_fp": 10 ** 400,
+        },
+    }
+    out = list(feed._dispatch(bad))  # must NOT raise
+    assert out == []                 # malformed frame yields nothing
+    assert feed.parse_errors == 1
+    assert feed._last_parse_error["kind"] == "delta"
+    # Feed still functional: the next valid delta parses normally.
+    good = list(feed._dispatch(_delta("yes", "0.2400", "100", seq=3)))
+    assert len(good) == 1
+    assert isinstance(good[0], BookEvent)
+
+
+def test_ws_survives_oversized_int_snapshot():
+    """An oversized int in a snapshot level is skipped, feed survives."""
+    feed = _feed()
+    bad = {
+        "type": "orderbook_snapshot",
+        "msg": {
+            "market_ticker": "KXBTC15M-T", "seq": 1,
+            "yes_dollars_fp": [["0.2200", 10 ** 400]],
+            "no_dollars_fp": [["0.7700", "800"]],
+        },
+    }
+    out = list(feed._dispatch(bad))
+    assert out == []
+    assert feed.parse_errors == 1
+    assert feed._last_parse_error["kind"] == "snapshot"
+    # A clean snapshot afterwards parses fine.
+    good = list(feed._dispatch(_snapshot()))
+    assert len(good) == 1
+    assert isinstance(good[0], BookEvent)

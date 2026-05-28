@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from typing import AsyncIterator, Iterable
 
@@ -105,6 +106,13 @@ class KalshiWebSocketFeed:
         self._ws = None
         self._sid: int | None = None
         self._cmd_id_counter = 1
+        # Phase 14.17 - count malformed-frame parse failures (e.g. a Kalshi
+        # payload carrying an oversized integer that raises OverflowError on
+        # float() conversion). Skipping the frame keeps the feed alive instead
+        # of bubbling the error to the reconnect loop (a single bad frame on
+        # repeat would otherwise reconnect-storm forever).
+        self.parse_errors = 0
+        self._last_parse_error: dict | None = None
 
     def _next_cmd_id(self) -> int:
         self._cmd_id_counter += 1
@@ -229,16 +237,22 @@ class KalshiWebSocketFeed:
     def _on_snapshot(self, ticker: str, msg: dict, seq):
         book = self._book(ticker)
         yes_levels, no_levels = _extract_levels(msg)
-        book["yes_bids"] = {
-            round(float(p) * 1000): float(s)
-            for p, s in yes_levels
-            if float(s) > 0
-        }
-        book["no_bids"] = {
-            round(float(p) * 1000): float(s)
-            for p, s in no_levels
-            if float(s) > 0
-        }
+        try:
+            yes_bids = {
+                round(float(p) * 1000): float(s)
+                for p, s in yes_levels
+                if float(s) > 0
+            }
+            no_bids = {
+                round(float(p) * 1000): float(s)
+                for p, s in no_levels
+                if float(s) > 0
+            }
+        except (OverflowError, ValueError, TypeError) as exc:
+            self._record_parse_error("snapshot", ticker, msg, exc)
+            return
+        book["yes_bids"] = yes_bids
+        book["no_bids"] = no_bids
         if seq is not None:
             book["last_seq"] = int(seq)
         yield self._build_book_event(ticker, msg)
@@ -276,13 +290,17 @@ class KalshiWebSocketFeed:
             None,
         )
 
-        dc = round(float(price) * 1000)
         levels = book["yes_bids"] if side == "yes" else book["no_bids"]
-        if delta is not None:
-            new_size = levels.get(dc, 0.0) + float(delta)
-        elif size is not None:
-            new_size = float(size)
-        else:
+        try:
+            dc = round(float(price) * 1000)
+            if delta is not None:
+                new_size = levels.get(dc, 0.0) + float(delta)
+            elif size is not None:
+                new_size = float(size)
+            else:
+                return
+        except (OverflowError, ValueError, TypeError) as exc:
+            self._record_parse_error("delta", ticker, msg, exc)
             return
         if new_size <= 0:
             levels.pop(dc, None)
@@ -296,13 +314,43 @@ class KalshiWebSocketFeed:
             return
         taker = (msg.get("taker_side") or "").lower()
         count_raw = msg.get("count_fp") or msg.get("count") or 0
+        try:
+            price_dc = round(float(yes_price) * 1000)
+            count = float(count_raw)
+        except (OverflowError, ValueError, TypeError) as exc:
+            self._record_parse_error("trade", ticker, msg, exc)
+            return
         yield TradeEvent(
             ticker=ticker,
             ts_ms=_normalize_ts(msg),
             recv_ms=_utc_now_ms(),
-            price=round(float(yes_price) * 1000),
-            count=float(count_raw),
+            price=price_dc,
+            count=count,
             taker_side=Side(taker) if taker in ("yes", "no") else Side.YES,
+        )
+
+    def _record_parse_error(self, kind: str, ticker: str, msg: dict,
+                             exc: Exception) -> None:
+        """Phase 14.17 - record + skip a frame whose numeric fields failed to
+        parse (OverflowError on an oversized int, or a malformed string). The
+        frame is dropped; the feed continues. Keeps a truncated sample of the
+        numeric-ish fields only (no auth/headers) for diagnosis."""
+        self.parse_errors += 1
+        sample_keys = (
+            "price_dollars", "price", "yes_price_dollars", "yes_price",
+            "delta_fp", "delta", "size", "count_fp", "count", "seq",
+        )
+        sample = {k: msg.get(k) for k in sample_keys if k in msg}
+        self._last_parse_error = {
+            "kind": kind,
+            "ticker": ticker,
+            "error": repr(exc),
+            "sample": str(sample)[:200],
+        }
+        print(
+            f"[kalshi_ws] parse_error kind={kind} ticker={ticker} "
+            f"err={exc!r} sample={str(sample)[:200]}",
+            file=sys.stderr, flush=True,
         )
 
     def _on_lifecycle(self, ticker: str, msg: dict):

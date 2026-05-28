@@ -21,6 +21,7 @@ from kalshi_engine.feeds.alpaca_spot import EquityTrade
 
 from kalshi_engine.bin.observe_inxu import (
     _InxuObserverState, _handle_book, _strike_from_market, _run_loop,
+    _sample_due_windows, _rest_orderbook_to_book,
 )
 
 
@@ -260,3 +261,112 @@ def test_run_loop_dispatches_event_then_honors_deadline():
     assert elapsed < 1.5
     env = [w for w in log.writes if w.get("kind") == "book_at_inxu_pretrigger"]
     assert len(env) == 1
+
+
+# ---- Phase 14.17: timer-driven sampling (decoupled from WS event timing) -
+
+def test_sample_due_windows_emits_from_cached_book():
+    """The core fix: a window fires from a CACHED book + wall-clock timer,
+    with no WS event landing inside the +/-60s window. This is what the
+    purely event-gated observer could never do (0 envelopes in 49.5h)."""
+    state, open_ms = _fresh_state()
+    log = _make_log()
+    alpaca = AsyncMock()
+    alpaca.get_last_trade.return_value = EquityTrade(
+        symbol="SPY", price=503.5, ts_ms=0, recv_ms=0, exchange="V")
+    # A book arrived at T+2 (well before the window) and was cached.
+    state.update_book(_make_book("KXINXU-CYC1-T6000", recv_ms=open_ms + 2 * 60_000))
+    now_ms = open_ms + 30 * 60_000  # synthetic wall-clock at T+30
+    n = asyncio.run(_sample_due_windows(state, alpaca, log, now_ms, client=None))
+    assert n == 1
+    env = [w for w in log.writes if w.get("kind") == "book_at_inxu_pretrigger"]
+    assert len(env) == 1
+    assert env[0]["window_label"] == "T+30"
+    assert env[0]["sample_source"] == "timer"
+    assert env[0]["spot"] == 503.5
+    assert env[0]["equity"] == "SPX"
+
+
+def test_sample_due_windows_dedup_across_ticks():
+    """Two timer ticks inside the same window emit only ONE envelope."""
+    state, open_ms = _fresh_state()
+    log = _make_log()
+    alpaca = AsyncMock()
+    alpaca.get_last_trade.return_value = EquityTrade(
+        symbol="SPY", price=500.0, ts_ms=0, recv_ms=0, exchange="V")
+    state.update_book(_make_book("KXINXU-CYC1-T6000", recv_ms=open_ms))
+    now_ms = open_ms + 30 * 60_000
+    asyncio.run(_sample_due_windows(state, alpaca, log, now_ms))
+    asyncio.run(_sample_due_windows(state, alpaca, log, now_ms + 5_000))
+    env = [w for w in log.writes if w.get("kind") == "book_at_inxu_pretrigger"]
+    assert len(env) == 1
+
+
+def test_sample_due_windows_rest_fallback_when_no_cached_book():
+    """When no WS book was cached, the timer REST-fetches the book (mirroring
+    the trader's REST path that logged 5,708 decisions) and still emits."""
+    state, open_ms = _fresh_state()
+    log = _make_log()
+    alpaca = AsyncMock()
+    alpaca.get_last_trade.return_value = EquityTrade(
+        symbol="SPY", price=500.0, ts_ms=0, recv_ms=0, exchange="V")
+    client = AsyncMock()
+    client._request.return_value = {
+        "orderbook": {"yes_dollars": [["0.95", "100"]],
+                      "no_dollars": [["0.04", "200"]]}
+    }
+    now_ms = open_ms + 30 * 60_000
+    n = asyncio.run(_sample_due_windows(state, alpaca, log, now_ms, client=client))
+    assert n == 1
+    env = [w for w in log.writes if w.get("kind") == "book_at_inxu_pretrigger"]
+    assert len(env) == 1
+    assert env[0]["sample_source"] == "timer"
+    client._request.assert_awaited()
+
+
+def test_sample_due_windows_no_book_no_client_logs_waiting_once():
+    """No cached book and no REST client -> log a single waiting diagnostic
+    (not spammed every tick), emit nothing, do NOT mark fired."""
+    state, open_ms = _fresh_state()
+    log = _make_log()
+    alpaca = AsyncMock()
+    now_ms = open_ms + 30 * 60_000
+    asyncio.run(_sample_due_windows(state, alpaca, log, now_ms, client=None))
+    asyncio.run(_sample_due_windows(state, alpaca, log, now_ms + 3_000, client=None))
+    waits = [w for w in log.writes if w.get("kind") == "pretrigger_waiting_no_book"]
+    assert len(waits) == 1  # deduped across ticks
+    assert not [w for w in log.writes if w.get("kind") == "book_at_inxu_pretrigger"]
+    alpaca.get_last_trade.assert_not_called()
+    # window not marked fired -> a book arriving later can still emit
+    assert ("KXINXU-CYC1-T6000", "T+30") not in state.fired
+
+
+def test_sample_due_windows_outside_window_no_emit():
+    state, open_ms = _fresh_state()
+    log = _make_log()
+    alpaca = AsyncMock()
+    state.update_book(_make_book("KXINXU-CYC1-T6000", recv_ms=open_ms))
+    now_ms = open_ms + 35 * 60_000  # T+35 is not in (30,40,50)
+    n = asyncio.run(_sample_due_windows(state, alpaca, log, now_ms))
+    assert n == 0
+    assert not log.writes
+    alpaca.get_last_trade.assert_not_called()
+
+
+def test_rest_orderbook_to_book_complement():
+    """REST orderbook parse derives bids via the Kalshi binary complement."""
+    ob = {"orderbook": {"yes_dollars": [["0.95", "10"], ["0.96", "5"]],
+                        "no_dollars": [["0.04", "20"]]}}
+    b = _rest_orderbook_to_book(ob, "T", now_ms=123)
+    assert b is not None
+    assert b.yes_ask == 950  # best (lowest) yes offer
+    assert b.no_ask == 40    # best (lowest) no offer
+    assert b.yes_bid == 960  # 1000 - no_ask
+    assert b.no_bid == 50    # 1000 - yes_ask
+
+
+def test_rest_orderbook_to_book_empty_book():
+    b = _rest_orderbook_to_book({"orderbook": {}}, "T", now_ms=1)
+    assert b is not None
+    assert b.yes_bid == 0 and b.no_bid == 0
+    assert b.yes_ask == 1000 and b.no_ask == 1000
