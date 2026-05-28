@@ -47,12 +47,23 @@ def _no_favorite_book(ticker: str, recv_ms: int) -> BookEvent:
 
 
 def _flat_otm_book(ticker: str, recv_ms: int) -> BookEvent:
-    """Both sides near 50c — no side is a DCA favorite (mid below the floor)."""
+    """Both sides near 50c — undecided, favorite mid 500 is below the band."""
     return BookEvent(
         ticker=ticker, ts_ms=recv_ms, recv_ms=recv_ms,
         yes_bid=480, yes_ask=520, no_bid=480, no_ask=520,
         yes_levels=((480, 5.0), (520, 5.0)),
         no_levels=((480, 5.0), (520, 5.0)),
+    )
+
+
+def _deep_itm_book(ticker: str, recv_ms: int) -> BookEvent:
+    """YES side decided at ~$0.995 — favorite mid 995 is ABOVE the band (no DCA
+    dip left to catch). A single floor would NOT exclude this; the upper bound
+    must."""
+    return BookEvent(
+        ticker=ticker, ts_ms=recv_ms, recv_ms=recv_ms,
+        yes_bid=990, yes_ask=1000, no_bid=0, no_ask=10,
+        yes_levels=((990, 838.0),), no_levels=((10, 5.0),),
     )
 
 
@@ -195,16 +206,16 @@ def test_emit_samples_writes_for_active_favorite_market():
     state.on_book(_no_favorite_book(ticker, sample_ms))
     log = _make_log()
     n = emit_samples(state, BPS_THRESHOLDS, log, sample_ms,
-                     min_favorite_mid_dc=550.0)
+                     min_favorite_mid_dc=600.0, max_favorite_mid_dc=970.0)
     assert n == 1
     assert len(log.writes) == 1
     assert log.writes[0]["kind"] == "dca_book_sample"
     assert log.writes[0]["ticker"] == ticker
 
 
-def test_emit_samples_skips_below_favorite_floor():
-    """A market with both sides near 50c (favorite mid 500 < 550 floor) is
-    not logged — bounds log volume to DCA-relevant near-favorite markets."""
+def test_emit_samples_skips_below_favorite_band():
+    """A market with both sides near 50c (favorite mid 500 < 600 band low) is
+    not logged — undecided ~50/50 noise."""
     open_ms = 1_800_000_000_000
     close_ms = open_ms + 60 * 60_000
     sample_ms = open_ms + 10 * 60_000
@@ -213,7 +224,24 @@ def test_emit_samples_skips_below_favorite_floor():
     state.on_book(_flat_otm_book(ticker, sample_ms))
     log = _make_log()
     n = emit_samples(state, BPS_THRESHOLDS, log, sample_ms,
-                     min_favorite_mid_dc=550.0)
+                     min_favorite_mid_dc=600.0, max_favorite_mid_dc=970.0)
+    assert n == 0
+    assert log.writes == []
+
+
+def test_emit_samples_skips_above_favorite_band():
+    """A deep-ITM market (favorite mid 995 > 970 band high) is not logged —
+    decided, no DCA dip left. Critical: its favorite side sits near 1000, so a
+    single floor would wrongly KEEP it; the upper bound excludes it."""
+    open_ms = 1_800_000_000_000
+    close_ms = open_ms + 60 * 60_000
+    sample_ms = open_ms + 10 * 60_000
+    ticker = "KXBTCD-CYC-T100500"
+    state = _state_with_market(ticker, open_ms, close_ms)
+    state.on_book(_deep_itm_book(ticker, sample_ms))
+    log = _make_log()
+    n = emit_samples(state, BPS_THRESHOLDS, log, sample_ms,
+                     min_favorite_mid_dc=600.0, max_favorite_mid_dc=970.0)
     assert n == 0
     assert log.writes == []
 
@@ -226,8 +254,8 @@ def test_emit_samples_skips_market_outside_cycle_window():
     # Sample BEFORE the cycle opens and AFTER it closes.
     log = _make_log()
     state.on_book(_no_favorite_book(ticker, open_ms - 1))
-    assert emit_samples(state, BPS_THRESHOLDS, log, open_ms - 1, 550.0) == 0
-    assert emit_samples(state, BPS_THRESHOLDS, log, close_ms + 1, 550.0) == 0
+    assert emit_samples(state, BPS_THRESHOLDS, log, open_ms - 1, 600.0, 970.0) == 0
+    assert emit_samples(state, BPS_THRESHOLDS, log, close_ms + 1, 600.0, 970.0) == 0
     assert log.writes == []
 
 
@@ -237,7 +265,7 @@ def test_emit_samples_skips_market_with_no_book():
     sample_ms = open_ms + 10 * 60_000
     state = _state_with_market("KXBTCD-CYC-T100500", open_ms, close_ms)
     log = _make_log()  # no on_book call -> no latest_book
-    assert emit_samples(state, BPS_THRESHOLDS, log, sample_ms, 550.0) == 0
+    assert emit_samples(state, BPS_THRESHOLDS, log, sample_ms, 600.0, 970.0) == 0
     assert log.writes == []
 
 
@@ -286,7 +314,8 @@ def test_run_loop_honors_deadline_and_samples():
     start = time.time()
     asyncio.run(_run_loop(
         state, BPS_THRESHOLDS, _SilentKalshiWs(), _SilentSpotFeed(), log,
-        sample_interval_s=0.2, min_favorite_mid_dc=550.0, duration_s=0.6,
+        sample_interval_s=0.2, min_favorite_mid_dc=600.0,
+        max_favorite_mid_dc=970.0, duration_s=0.6,
     ))
     elapsed = time.time() - start
     assert elapsed < 2.0, f"run_loop overshot deadline: {elapsed:.2f}s"

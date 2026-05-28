@@ -65,7 +65,8 @@ $Svc = @{
     Args = @(
         "--cryptos", "BTC,ETH",
         "--sample-interval-s", "7",
-        "--min-favorite-mid-dc", "550",
+        "--min-favorite-mid-dc", "600",
+        "--max-favorite-mid-dc", "970",
         "--cutpoints-version", "v1",
         "--spot-source", "bitstamp",
         "--log-path", "$LogDir\dca_book_sample.jsonl"

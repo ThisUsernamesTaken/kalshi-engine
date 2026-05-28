@@ -116,10 +116,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--sample-interval-s", type=float, default=7.0,
                    help="seconds between dense samples per active market "
                         "(default 7.0; the design's 5-10s band)")
-    p.add_argument("--min-favorite-mid-dc", type=float, default=550.0,
-                   help="only sample a market once its favorite mid (decicents) "
-                        "clears this floor, so far-OTM flatline strikes don't "
-                        "flood the log (default 550 = $0.55)")
+    p.add_argument("--min-favorite-mid-dc", type=float, default=600.0,
+                   help="lower bound of the favorite-mid sampling band "
+                        "(decicents). Below this a market is undecided "
+                        "(~50/50) noise (default 600 = $0.60)")
+    p.add_argument("--max-favorite-mid-dc", type=float, default=970.0,
+                   help="upper bound of the favorite-mid sampling band "
+                        "(decicents). Above this the market is effectively "
+                        "decided (deep-ITM flatline, no DCA dip to catch). "
+                        "Together with --min, samples only the 'chase zone' "
+                        "where DCA adds would rest/fill — bounds log volume "
+                        "and excludes both useless extremes (default 970 = "
+                        "$0.97; cf. the 1hr ladder's 750-950 entry band)")
     p.add_argument("--cutpoints-version", default="v1",
                    help="cutpoints artifact version for the V13B bps thresholds "
                         "(default v1 — matches the live 1hr trader)")
@@ -317,10 +325,19 @@ def emit_samples(
     log: LiveLogWriter,
     sample_ms: int,
     min_favorite_mid_dc: float,
+    max_favorite_mid_dc: float,
 ) -> int:
-    """Emit one dense sample per active, at-/near-favorite market. Returns the
-    number of samples written. Synchronous + side-effecting only through
-    ``log`` so it is straightforward to test against a mocked book feed."""
+    """Emit one dense sample per active market whose favorite mid is in the
+    chase-zone band [min, max]. Returns the number of samples written.
+    Synchronous + side-effecting only through ``log`` so it is straightforward
+    to test against a mocked book feed.
+
+    The band excludes both useless extremes: below ``min`` the market is an
+    undecided ~50/50 (no favorite yet), above ``max`` it is effectively decided
+    (deep-ITM flatline — no DCA dip left to catch). Note a deep-ITM strike's
+    favorite (winning) side sits near 1000, so a single floor would NOT exclude
+    it; the upper bound is what keeps far-from-money flatlines out of the log.
+    """
     written = 0
     for ticker, meta in list(state.markets.items()):
         book = state.latest_book.get(ticker)
@@ -333,8 +350,9 @@ def emit_samples(
         threshold = float(bps_thresholds.get(crypto, 0.0))
         rec = build_dca_sample(book, meta, state.state_for(crypto),
                                threshold, sample_ms)
-        if rec["favorite_mid_decicents"] < min_favorite_mid_dc:
-            continue  # far-OTM flatline strike — skip to bound log volume
+        fav_mid = rec["favorite_mid_decicents"]
+        if not (min_favorite_mid_dc <= fav_mid <= max_favorite_mid_dc):
+            continue  # outside the chase-zone band — skip to bound log volume
         log.write(rec)
         written += 1
     return written
@@ -443,7 +461,7 @@ async def _discovery_loop(
 async def _run_loop(
     state: _DcaSampleState, bps_thresholds: dict, kalshi_ws, spot_feed,
     log: LiveLogWriter, sample_interval_s: float, min_favorite_mid_dc: float,
-    duration_s: float,
+    max_favorite_mid_dc: float, duration_s: float,
 ) -> None:
     """Run the WS pump, spot pump, and sampling timer until the deadline.
 
@@ -493,7 +511,8 @@ async def _run_loop(
                 return
             try:
                 emit_samples(state, bps_thresholds, log,
-                             int(time.time() * 1000), min_favorite_mid_dc)
+                             int(time.time() * 1000), min_favorite_mid_dc,
+                             max_favorite_mid_dc)
             except asyncio.CancelledError:
                 return
             except Exception as exc:
@@ -578,6 +597,7 @@ async def _amain(args: argparse.Namespace) -> int:
             "cryptos": [c.value for c in cryptos],
             "sample_interval_s": args.sample_interval_s,
             "min_favorite_mid_dc": args.min_favorite_mid_dc,
+            "max_favorite_mid_dc": args.max_favorite_mid_dc,
             "cutpoints_version": args.cutpoints_version,
             "bps_thresholds": bps_thresholds,
             "spot_source": args.spot_source,
@@ -597,7 +617,7 @@ async def _amain(args: argparse.Namespace) -> int:
             await _run_loop(
                 state, bps_thresholds, kalshi_ws, spot_feed, log,
                 args.sample_interval_s, args.min_favorite_mid_dc,
-                args.duration_s,
+                args.max_favorite_mid_dc, args.duration_s,
             )
         finally:
             discovery_task.cancel()
