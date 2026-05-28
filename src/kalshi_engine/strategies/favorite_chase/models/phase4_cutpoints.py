@@ -118,7 +118,7 @@ SUPER_BAND_HIGH = -0.09
 S2_SKIP_BELOW = 3.0
 S2_SIZE_AT_4 = 5
 S2_SIZE_AT_5 = 8
-S2_SIZE_AT_6 = 10
+S2_SIZE_AT_6 = 12
 
 # Phase 12.13 (V13b H1+H4 mix) — high-yield variant of S2. Same V13b score
 # formula and hard gates. SKIPs everything below score=4.0 (H1's score-floor:

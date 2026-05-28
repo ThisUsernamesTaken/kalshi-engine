@@ -86,7 +86,7 @@ def test_5tier_v13b_s2_constants():
     assert S2_SKIP_BELOW == 3.0
     assert S2_SIZE_AT_4 == 5
     assert S2_SIZE_AT_5 == 8
-    assert S2_SIZE_AT_6 == 10
+    assert S2_SIZE_AT_6 == 12
 
 
 # ---- tier-boundary table --------------------------------------------------
@@ -168,14 +168,14 @@ def test_s2_score_5p5_yields_8ct():
     assert d.size == 8
 
 
-def test_s2_score_6p5_yields_10ct():
-    """score=6.5 (all four components) -> tier >= 6.0 -> 10 ct."""
+def test_s2_score_6p5_yields_12ct():
+    """score=6.5 (all four components) -> tier >= 6.0 -> 12 ct."""
     d = _eval_s2(side=Side.NO, bb_div_val=-0.10, strike=90_000.0,
                  fav_mid_dc=200.0)
     assert d.action is Action.ENTER
     assert d.diagnostics["score_5tier_v13b_s2"] == 6.5
     assert d.size == S2_SIZE_AT_6
-    assert d.size == 10
+    assert d.size == 12
 
 
 # ---- SKIP cases -----------------------------------------------------------
@@ -236,7 +236,7 @@ def test_s2_reason_format_includes_score_and_size():
     d = _eval_s2(side=Side.NO, bb_div_val=-0.10, strike=90_000.0,
                  fav_mid_dc=200.0)
     assert d.reason.startswith("5TIER_V13B_S2 score=")
-    assert "-> 10ct" in d.reason
+    assert "-> 12ct" in d.reason
 
 
 # ---- regression: 5tier_v13b unchanged ------------------------------------

@@ -194,7 +194,7 @@ def test_flat_max_size_is_3():
 # ---- regression: existing modes unchanged --------------------------------
 
 def test_5tier_v13b_h1h4_unchanged_after_flat():
-    """Sanity: H1H4 still gives 10ct at score 6.5."""
+    """Sanity: H1H4 still gives 12ct at score 6.5."""
     model = Phase4CutpointsModel(align_mode="5tier_v13b_h1h4")
     ts = int(datetime(2026, 5, 24, 20, 0, 0,
                       tzinfo=timezone.utc).timestamp() * 1000)
@@ -205,7 +205,7 @@ def test_5tier_v13b_h1h4_unchanged_after_flat():
     )
     assert d.action is Action.ENTER
     assert d.diagnostics["score_5tier_v13b_h1h4"] == 6.5
-    assert d.size == 10
+    assert d.size == 12
 
 
 def test_invalid_align_mode_still_rejected():

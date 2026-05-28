@@ -114,7 +114,7 @@ def test_loose_score_5p0_yields_9ct():
 
 
 def test_loose_score_5p5_yields_10ct():
-    """score=5.5 (div_band=1 + side_no=1 + bps_strong=1) -> 10 ct (capped)."""
+    """score=5.5 (div_band=1 + side_no=1 + bps_strong=1) -> round(9.9)=10 ct (below the 12 cap)."""
     d = _eval_loose(side=Side.NO, bb_div_val=-0.05, strike=90_000.0,
                     fav_mid_dc=200.0)
     assert d.action is Action.ENTER
@@ -122,13 +122,13 @@ def test_loose_score_5p5_yields_10ct():
     assert d.size == 10
 
 
-def test_loose_score_6p5_yields_10ct_capped():
-    """score=6.5 (all four, NO) -> round(11.7)=12 capped to 10."""
+def test_loose_score_6p5_yields_12ct():
+    """score=6.5 (all four, NO) -> round(11.7)=12, at the S2_SIZE_AT_6=12 cap."""
     d = _eval_loose(side=Side.NO, bb_div_val=-0.10, strike=90_000.0,
                     fav_mid_dc=200.0)
     assert d.action is Action.ENTER
     assert d.diagnostics["score_5tier_v13b_h1h4_loose"] == 6.5
-    assert d.size == S2_SIZE_AT_6 == 10
+    assert d.size == S2_SIZE_AT_6 == 12
 
 
 # ---- borderline tier [3.0, 4.0): targeted loosening ----------------------
@@ -232,7 +232,7 @@ def test_loose_reason_format_on_enter():
     d = _eval_loose(side=Side.NO, bb_div_val=-0.10, strike=90_000.0,
                     fav_mid_dc=200.0)
     assert d.reason.startswith("5TIER_V13B_H1H4_LOOSE score=")
-    assert "-> 10ct" in d.reason
+    assert "-> 12ct" in d.reason
 
 
 # ---- regression: existing modes unchanged --------------------------------

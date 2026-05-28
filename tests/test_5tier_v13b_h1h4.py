@@ -5,12 +5,12 @@ Same V13b score formula as ``5tier_v13b``. SKIPs everything below score=4.0
 was 58/58 wins). On what passes, sizes by H4's smooth score multiplier:
 
     score < 4.0        -> SKIP
-    size = min(10, round(score * 1.8))
+    size = min(12, round(score * 1.8))
     # score 4.0 -> 7 ct
     # score 4.5 -> 8 ct
     # score 5.0 -> 9 ct
-    # score 5.5 -> 10 ct (capped from 9.9)
-    # score >= 6.0 -> 10 ct (capped)
+    # score 5.5 -> 10 ct (round(9.9), below the 12 cap)
+    # score 6.5 -> 12 ct (round(11.7)=12, at the cap)
 
 Tests cover each achievable V13b score (>= 4) -> expected size, plus the
 score-floor SKIP at 3.5, the s_bps hard gate, diagnostics, reason format,
@@ -122,9 +122,9 @@ def test_h1h4_score_5p0_yields_9ct():
     assert d.size == 9
 
 
-def test_h1h4_score_5p5_yields_10ct_capped():
+def test_h1h4_score_5p5_yields_10ct():
     """score=5.5 (div_band=1 + side_no=1 + bps_strong=1, no super_band)
-    -> round(9.9)=10 -> 10 ct (capped from 9.9 by S2_SIZE_AT_6)."""
+    -> round(9.9)=10 -> 10 ct (below the S2_SIZE_AT_6=12 cap)."""
     d = _eval_h1h4(side=Side.NO, bb_div_val=-0.05, strike=90_000.0,
                    fav_mid_dc=200.0)
     assert d.action is Action.ENTER
@@ -132,14 +132,14 @@ def test_h1h4_score_5p5_yields_10ct_capped():
     assert d.size == 10
 
 
-def test_h1h4_score_6p5_yields_10ct_capped():
-    """score=6.5 (all four components, NO side) -> round(11.7)=12 capped to 10."""
+def test_h1h4_score_6p5_yields_12ct():
+    """score=6.5 (all four components, NO side) -> round(11.7)=12, cap=12 (not reduced)."""
     d = _eval_h1h4(side=Side.NO, bb_div_val=-0.10, strike=90_000.0,
                    fav_mid_dc=200.0)
     assert d.action is Action.ENTER
     assert d.diagnostics["score_5tier_v13b_h1h4"] == 6.5
     assert d.size == S2_SIZE_AT_6
-    assert d.size == 10
+    assert d.size == 12
 
 
 # ---- SKIP cases (score < 4.0) --------------------------------------------
@@ -195,7 +195,7 @@ def test_h1h4_reason_format():
     d = _eval_h1h4(side=Side.NO, bb_div_val=-0.10, strike=90_000.0,
                    fav_mid_dc=200.0)
     assert d.reason.startswith("5TIER_V13B_H1H4 score=")
-    assert "-> 10ct" in d.reason
+    assert "-> 12ct" in d.reason
 
 
 # ---- regression: existing modes unchanged --------------------------------
