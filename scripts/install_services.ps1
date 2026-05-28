@@ -103,7 +103,7 @@ $Services = @(
             "--model", "phase4_cutpoints",
             "--cutpoints-version", "v1",
             "--align-mode", "5tier_v13b_h1h4_loose",
-            "--max-contracts", "10",
+            "--max-contracts", "12",
             "--reentry-mode", "disabled",
             "--time-of-day-skip", "enabled",
             "--cryptos", "BTC,ETH,SOL,XRP,DOGE",
