@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-    Uninstall the 5 Kalshi engine NSSM services created by install_services.ps1.
+    Uninstall the 6 Kalshi engine NSSM services created by install_services.ps1.
 
 .DESCRIPTION
     Stops then removes:
       KalshiEngine15m, KalshiEngine1hr, KalshiObserver1hr,
-      KalshiEngineInxu, KalshiObserverInxu.
+      KalshiEngineInxu, KalshiObserverInxu, KalshiEngineCommodity.
 
     KalshiCapture is NOT touched - that's a pre-existing service.
 
@@ -30,7 +30,8 @@ $Services = @(
     "KalshiEngine1hr",
     "KalshiObserver1hr",
     "KalshiEngineInxu",
-    "KalshiObserverInxu"
+    "KalshiObserverInxu",
+    "KalshiEngineCommodity"
 )
 
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")

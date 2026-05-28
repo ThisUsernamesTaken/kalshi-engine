@@ -9,6 +9,7 @@
       - KalshiObserver1hr   - 1hr crypto observer (read-only)
       - KalshiEngineInxu    - KXINXU equity-index shim (real money, 1ct/$5cap)
       - KalshiObserverInxu  - KXINXU equity-index observer (read-only)
+      - KalshiEngineCommodity - KXGOLDD commodity daily-ladder engine (real money, 1ct/$5cap)
 
     KalshiCapture is NOT touched - it's already an NSSM service.
 
@@ -202,6 +203,26 @@ $Services = @(
             "--log-path", "$LogDir\inxu_observer.jsonl"
         )
         Env = $EnvWithAlpaca
+    }
+    @{
+        Name = "KalshiEngineCommodity"
+        DisplayName = "Kalshi Engine - commodity daily ladder (KXGOLDD)"
+        Description = "Live commodity daily-ladder engine (real money, 1ct/`$5/day per product, `$10/day total). Phase 14.16. GOLD only at launch (Pyth Metal.XAU/USD = exact settlement source). BRENT data-blocked (BRENTQ6 dead on Pyth) - framework-ready, disabled. Pyth is keyless so no extra creds. Daily-window controller: chase 60-10 min before 5pm ET settle."
+        Module = "kalshi_engine.bin.live_commodity"
+        Args = @(
+            "--commodities", "GOLD",
+            "--align-mode", "5tier_v13b_commodity_1ct_flat",
+            "--max-contracts", "1",
+            "--daily-cap-cents", "500",
+            "--total-daily-cap-cents", "1000",
+            "--cutpoints-version", "commodity_v1",
+            "--window-open-minutes", "60",
+            "--window-close-minutes", "10",
+            "--observe-times", "60,45,30,20,15",
+            "--time-of-day-skip", "disabled",
+            "--log-path", "$LogDir\live_commodity_kalshi_engine.jsonl"
+        )
+        Env = $CommonEnv
     }
 )
 

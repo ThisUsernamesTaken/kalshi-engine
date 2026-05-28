@@ -30,9 +30,10 @@ $ErrorActionPreference = "Stop"
 $StartOrder = @(
     "KalshiObserver1hr",
     "KalshiObserverInxu",
-    "KalshiEngineInxu",     # 1ct / $5cap - smallest real-money exposure
-    "KalshiEngine15m",      # 10ct / $10cap
-    "KalshiEngine1hr"       # up to 10ct / $10cap (or override)
+    "KalshiEngineInxu",       # 1ct / $5cap - smallest real-money exposure
+    "KalshiEngineCommodity",  # 1ct / $5cap per product / $10 total (GOLD only)
+    "KalshiEngine15m",        # 10ct / $10cap
+    "KalshiEngine1hr"         # up to 10ct / $10cap (or override)
 )
 
 $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
@@ -42,10 +43,10 @@ if (-not $isAdmin) {
 }
 
 if (-not $SkipConfirm) {
-    Write-Host "About to start 5 services in this order:"
+    Write-Host "About to start 6 services in this order:"
     $StartOrder | ForEach-Object { Write-Host "  $_" }
     Write-Host ""
-    Write-Host "3 of these (Engine15m, Engine1hr, EngineInxu) place REAL MONEY orders."
+    Write-Host "4 of these (Engine15m, Engine1hr, EngineInxu, EngineCommodity) place REAL MONEY orders."
     $reply = Read-Host "Continue? (y/N)"
     if ($reply -notmatch '^[yY]') {
         Write-Host "Aborted."
@@ -84,7 +85,7 @@ foreach ($name in $StartOrder) {
 
 Write-Host ""
 Write-Host "===================================================="
-Write-Host " All 5 services started."
+Write-Host " All 6 services started."
 Write-Host "===================================================="
 Write-Host ""
 Write-Host "Verify with:"

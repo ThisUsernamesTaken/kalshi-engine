@@ -198,6 +198,22 @@ RAMP_SIZE_TIER3 = 3   # score >= 6.0
 EQUITY_1CT_FLAT_SKIP_BELOW = 4.0
 EQUITY_1CT_FLAT_SIZE = 1
 
+# Phase 14.16 (V13b COMMODITY 1ct flat) — minimum-risk launch sizing for the
+# first live commodity daily-ladder engine (KXGOLDD; KXBRENTD framework-ready
+# but data-blocked). Identical mechanics to the equity 1ct-flat mode: same
+# V13b score formula + hard gates, SKIP score<4 (H1 floor), all passing trades
+# at flat 1 contract. Worst per-trade loss ~$0.92 at MAX_FAV_COST=920.
+#
+# Unlike the equity shim, the bps gate genuinely discriminates here: the Pyth
+# feed IS the exact Kalshi settlement variable (no SPY/SPX scale mismatch), so
+# bps_margin / bb_div are computed on the true settlement source and the
+# commodity cutpoints carry real per-product bps_thresholds (GOLD/BRENT).
+# Cutpoints remain crypto-regime-calibrated otherwise — the boot envelope warns
+# and the 1ct/$5-day cap bounds the forward-test risk. Promote to a conviction
+# ramp only after >=100 commodity trades show projected EV holding.
+COMMODITY_1CT_FLAT_SKIP_BELOW = 4.0
+COMMODITY_1CT_FLAT_SIZE = 1
+
 # Phase 13.2 (V13b 10-flat) — scaled-up sizing variant of 1to3_flat for the
 # 1hr live engine. Same V13b score formula and hard gates. SKIPs <4, sizes
 # ALL passing trades at flat 10 contracts. The T3 ("all-in >=4") winner
@@ -279,7 +295,7 @@ ALIGN_MODES = ("disabled", "2tier", "3tier", "5tier",
                "5tier_v13b_1to3_flat", "5tier_v13b_10_flat",
                "5tier_v13b_7_10_10", "5tier_v13b_h1h4_loose",
                "5tier_v13b_equity_1ct_flat", "5tier_v13b_1to3_ramp",
-               "5tier_v13b_btc_dnorm_gate")
+               "5tier_v13b_btc_dnorm_gate", "5tier_v13b_commodity_1ct_flat")
 
 
 class Phase4CutpointsModel:
@@ -995,6 +1011,50 @@ class Phase4CutpointsModel:
                 ticker=ticker, action=Action.ENTER, side=side, size=size,
                 confidence=conf,
                 reason=(f"5TIER_V13B_EQUITY_1CT_FLAT score={score:.1f} -> {size}ct "
+                        f"(div_band={bb_div_band} side_no={side_no} "
+                        f"bps_strong={bps_strong} super_band={super_band})"),
+                diagnostics=diag)
+
+        if self.align_mode == "5tier_v13b_commodity_1ct_flat":
+            # Phase 14.16 — minimum-risk launch sizing for the first live
+            # commodity daily-ladder engine. Same V13b score + hard gates.
+            # SKIPs score<4, sizes ALL passing trades at flat 1 contract.
+            # Worst per-trade loss ~$0.92 (MAX_FAV_COST=920); per-product
+            # $5/day cap binds at ~5 losses. See COMMODITY_1CT_FLAT_* docstring.
+            if s_bps == 0:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_COMMODITY_1CT_FLAT skip: s_bps=0 "
+                    f"(bps_margin {bps_margin:.2f} <= "
+                    f"{ALIGN_BPS_MULT}*{threshold:.2f})", diag)
+            bb_div_band = 1 if (DEEP_DIV_SKIP < bb_div <= DIV_BAND_UPPER) else 0
+            side_no = 1 if side is Side.NO else 0
+            side_yes = 1 - side_no
+            bps_strong = 1 if bps_margin > BPS_STRONG_MULT * threshold else 0
+            super_band = 1 if (SUPER_BAND_LOW < bb_div <= SUPER_BAND_HIGH) else 0
+            score = (2.0 * bb_div_band + 1.5 * side_no
+                     + 2.0 * bps_strong + 1.0 * super_band)
+            diag.update({
+                "bb_div_band": bb_div_band,
+                "bps_strong": bps_strong,
+                "side_yes": side_yes,
+                "side_no": side_no,
+                "super_band": super_band,
+                "score_5tier_v13b_commodity_1ct_flat": score,
+            })
+            if score < COMMODITY_1CT_FLAT_SKIP_BELOW:
+                return self._skip(
+                    ticker, side,
+                    f"5TIER_V13B_COMMODITY_1CT_FLAT skip: score={score:.1f} < "
+                    f"{COMMODITY_1CT_FLAT_SKIP_BELOW} (div_band={bb_div_band} "
+                    f"side_no={side_no} bps_strong={bps_strong} "
+                    f"super_band={super_band})", diag)
+            size = COMMODITY_1CT_FLAT_SIZE
+            conf = min(1.0, score / 6.5)
+            return Decision(
+                ticker=ticker, action=Action.ENTER, side=side, size=size,
+                confidence=conf,
+                reason=(f"5TIER_V13B_COMMODITY_1CT_FLAT score={score:.1f} -> {size}ct "
                         f"(div_band={bb_div_band} side_no={side_no} "
                         f"bps_strong={bps_strong} super_band={super_band})"),
                 diagnostics=diag)
