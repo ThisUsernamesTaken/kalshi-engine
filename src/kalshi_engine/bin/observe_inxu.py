@@ -32,7 +32,6 @@ from pathlib import Path
 
 from kalshi_engine.config import RAW_DIR
 from kalshi_engine.core.equity import Equity, SPECS
-from kalshi_engine.core.events import BookEvent
 from kalshi_engine.execution.kalshi_client import KalshiClient
 from kalshi_engine.feeds.alpaca_spot import (
     AlpacaSpotPoller, credentials_from_env,
@@ -122,13 +121,6 @@ class _InxuObserverState:
         self.fired: set[tuple[str, str]] = set()
         # Phase 14.13 - per-ticker latest open_interest, refreshed by discovery.
         self.oi: dict[str, float] = {}
-        # Phase 14.17 - latest book quote per ticker, cached from the WS pump.
-        # The timer-driven sampler reads this so that emission no longer
-        # depends on a WS event happening to land inside a +/-60s window.
-        self.last_book: dict[str, BookEvent] = {}
-        # (ticker, window_label) we've already logged a "waiting, no book"
-        # diagnostic for, so the timer loop doesn't spam it every tick.
-        self.window_seen_no_book: set[tuple[str, str]] = set()
 
     def register(self, ticker: str, strike: float, open_ms: int,
                   close_ms: int, series: str, equity: Equity) -> None:
@@ -145,13 +137,6 @@ class _InxuObserverState:
             self.oi[ticker] = float(oi)
         except (TypeError, ValueError):
             pass
-
-    def update_book(self, ev: BookEvent) -> None:
-        """Phase 14.17 - cache the latest book quote for a registered ticker
-        so the timer-driven sampler always has a book to sample at a window,
-        even when no WS event arrives during the +/-60s window itself."""
-        if ev.ticker in self.markets:
-            self.last_book[ev.ticker] = ev
 
     def window_label(self, elapsed_min: float) -> str | None:
         """Return 'T+30' / 'T+40' / 'T+50' if elapsed is within 60s of a
@@ -248,23 +233,21 @@ async def _discover_markets_with_retry(client: KalshiClient, equities: list[Equi
             return None
 
 
-async def _emit_pretrigger(state: _InxuObserverState, ticker: str,
-                            book: BookEvent, wl: str, now_ms: int,
-                            alpaca: AlpacaSpotPoller, log: LiveLogWriter,
-                            sample_source: str) -> bool:
-    """Poll Alpaca and emit one ``book_at_inxu_pretrigger`` envelope for
-    (ticker, window). Shared by the WS event path (_handle_book) and the
-    timer-driven sampler (_sample_due_windows). Marks the window fired so it
-    fires at most once per cycle regardless of which path triggered it.
-
-    Returns True if an envelope was emitted, False if it was skipped (poll
-    failed -> still marks fired so we don't re-poll the same window forever)."""
-    market = state.markets.get(ticker)
+async def _handle_book(ev, state: _InxuObserverState,
+                        alpaca: AlpacaSpotPoller, log: LiveLogWriter) -> None:
+    """On every book update, check if we're inside an observe window for
+    this ticker's cycle. If yes and not yet fired this cycle/window, poll
+    Alpaca and emit the envelope."""
+    market = state.markets.get(ev.ticker)
     if not market:
-        return False
-    key = (ticker, wl)
+        return
+    elapsed_min = (ev.recv_ms - market["open_ms"]) / 60_000.0
+    wl = state.window_label(elapsed_min)
+    if wl is None:
+        return
+    key = (ev.ticker, wl)
     if key in state.fired:
-        return False
+        return  # already captured this window for this cycle
     eq: Equity = market["equity"]
     spec = SPECS[eq]
     trade = await alpaca.get_last_trade(spec.alpaca_symbol)
@@ -272,12 +255,12 @@ async def _emit_pretrigger(state: _InxuObserverState, ticker: str,
         # Market closed OR poll failed. Log and skip - implied-spot
         # fallback to be wired in a future phase per the prototype findings.
         log.write({
-            "kind": "spot_poll_skip", "ticker": ticker,
+            "kind": "spot_poll_skip", "ticker": ev.ticker,
             "alpaca_symbol": spec.alpaca_symbol, "window_label": wl,
             "reason": "market_closed_or_poll_failed",
         })
         state.fired.add(key)
-        return False
+        return
     # Phase 14.13 - OI aggregates over the cycle's strikes. Adapt the
     # state.markets dict-shaped values into objects the shared helper can
     # access via attributes.
@@ -291,148 +274,33 @@ async def _emit_pretrigger(state: _InxuObserverState, ticker: str,
         for tk, mv in state.markets.items()
     }
     oi_features = _cycle_oi_aggregates(
-        ticker, state.oi.get(ticker),
+        ev.ticker, state.oi.get(ev.ticker),
         int(market["open_ms"]), trade.price, adapter_markets, state.oi,
     )
-    elapsed_min = (now_ms - market["open_ms"]) / 60_000.0
     # Build pretrigger envelope mirroring book_at_1hr_pretrigger schema
     envelope = {
         "kind": "book_at_inxu_pretrigger",
-        "ticker": ticker,
+        "ticker": ev.ticker,
         "equity": eq.value,
         "kalshi_series": spec.kalshi_series,
         "alpaca_symbol": spec.alpaca_symbol,
-        "ts_ms": now_ms,
+        "ts_ms": ev.recv_ms,
         "cycle_open_ms": market["open_ms"],
         "cycle_close_ms": market["close_ms"],
         "elapsed_min": elapsed_min,
-        "tau_min": (market["close_ms"] - now_ms) / 60_000.0,
+        "tau_min": (market["close_ms"] - ev.recv_ms) / 60_000.0,
         "window_label": wl,
-        "yes_bid": book.yes_bid, "yes_ask": book.yes_ask,
-        "no_bid": book.no_bid, "no_ask": book.no_ask,
+        "yes_bid": ev.yes_bid, "yes_ask": ev.yes_ask,
+        "no_bid": ev.no_bid, "no_ask": ev.no_ask,
         "spot": trade.price,
         "spot_ts_ms": trade.ts_ms,
         "spot_exchange": trade.exchange,
         "strike": market["strike"],
-        "sample_source": sample_source,
         # Phase 14.13 OI features
         **oi_features,
     }
     log.write(envelope)
     state.fired.add(key)
-    return True
-
-
-async def _handle_book(ev, state: _InxuObserverState,
-                        alpaca: AlpacaSpotPoller, log: LiveLogWriter) -> None:
-    """WS event path: cache the book, and if this event happens to land inside
-    an observe window, emit immediately. The timer-driven sampler
-    (_sample_due_windows) is the primary trigger; this is a fast-path that
-    fires the moment a book arrives in-window. Both share state.fired so a
-    window emits at most once per cycle."""
-    market = state.markets.get(ev.ticker)
-    if not market:
-        return
-    state.update_book(ev)
-    elapsed_min = (ev.recv_ms - market["open_ms"]) / 60_000.0
-    wl = state.window_label(elapsed_min)
-    if wl is None:
-        return
-    await _emit_pretrigger(state, ev.ticker, ev, wl, ev.recv_ms, alpaca, log,
-                           sample_source="ws_event")
-
-
-def _rest_orderbook_to_book(ob: dict, ticker: str, now_ms: int) -> BookEvent | None:
-    """Build a BookEvent from a Kalshi REST orderbook payload, mirroring the
-    proven parse in live_inxu_v0.parse_orderbook (the trader logged 5,708
-    decisions off this exact parse). Used as a fallback when no WS book has
-    been cached for a ticker by the time its observe window arrives.
-
-    Kalshi's orderbook stores per-side resting offers in dollars; the binary
-    complement gives the opposite side's bid: yes_bid = 1000 - no_ask."""
-    raw = ob.get("orderbook") or ob.get("orderbook_fp") or {}
-    if not isinstance(raw, dict):
-        return None
-
-    def _top(levels):
-        if not levels:
-            return None, 0.0
-        try:
-            lv = [(float(p), float(s)) for p, s in levels]
-        except (TypeError, ValueError, OverflowError):
-            return None, 0.0
-        lv.sort(key=lambda x: x[0])  # ascending price; best offer = lowest
-        p, sz = lv[0]
-        return int(round(p * 1000)), sz
-
-    yes_ask_dc, _ = _top(raw.get("yes_dollars") or raw.get("yes_dollars_fp")
-                          or raw.get("yes"))
-    no_ask_dc, _ = _top(raw.get("no_dollars") or raw.get("no_dollars_fp")
-                        or raw.get("no"))
-    yes_bid = (1000 - no_ask_dc) if no_ask_dc is not None else 0
-    no_bid = (1000 - yes_ask_dc) if yes_ask_dc is not None else 0
-    yes_ask = yes_ask_dc if yes_ask_dc is not None else 1000
-    no_ask = no_ask_dc if no_ask_dc is not None else 1000
-    return BookEvent(
-        ticker=ticker, ts_ms=now_ms, recv_ms=now_ms,
-        yes_bid=yes_bid, yes_ask=yes_ask, no_bid=no_bid, no_ask=no_ask,
-        yes_levels=(), no_levels=(),
-    )
-
-
-async def _fetch_rest_book(client, ticker: str, now_ms: int,
-                            log: LiveLogWriter) -> BookEvent | None:
-    """REST-fetch a single market's orderbook and parse it into a BookEvent.
-    Returns None on transport/parse failure (logged)."""
-    if client is None:
-        return None
-    try:
-        ob = await client._request("GET", f"/markets/{ticker}/orderbook")
-    except Exception as exc:
-        log.write({"kind": "orderbook_error", "ticker": ticker,
-                   "error": repr(exc)})
-        return None
-    return _rest_orderbook_to_book(ob, ticker, now_ms)
-
-
-async def _sample_due_windows(state: _InxuObserverState,
-                               alpaca: AlpacaSpotPoller, log: LiveLogWriter,
-                               now_ms: int, client=None) -> int:
-    """Timer-driven sampler (mirrors the trader's wall-clock decision loop).
-    For every registered market, compute elapsed minutes from ``now_ms`` and,
-    if inside an unfired observe window, emit a pretrigger using the cached WS
-    book (or a REST-fetched book as fallback). Returns # envelopes emitted.
-
-    This is the fix for the Phase 14.16 defect where the observer never
-    emitted: it was purely WS-event-gated, so a book had to arrive within a
-    +/-60s window. Decoupling the trigger from the event stream means any
-    cached book (from any prior WS event in the cycle) is sampled on schedule.
-    """
-    emitted = 0
-    for ticker, market in list(state.markets.items()):
-        elapsed_min = (now_ms - market["open_ms"]) / 60_000.0
-        wl = state.window_label(elapsed_min)
-        if wl is None:
-            continue
-        key = (ticker, wl)
-        if key in state.fired:
-            continue
-        book = state.last_book.get(ticker)
-        if book is None:
-            book = await _fetch_rest_book(client, ticker, now_ms, log)
-        if book is None:
-            if key not in state.window_seen_no_book:
-                state.window_seen_no_book.add(key)
-                log.write({
-                    "kind": "pretrigger_waiting_no_book",
-                    "ticker": ticker, "window_label": wl,
-                    "elapsed_min": elapsed_min,
-                })
-            continue
-        if await _emit_pretrigger(state, ticker, book, wl, now_ms, alpaca, log,
-                                  sample_source="timer"):
-            emitted += 1
-    return emitted
 
 
 async def _amain(args: argparse.Namespace) -> int:
@@ -503,21 +371,10 @@ async def _amain(args: argparse.Namespace) -> int:
             discovery_task = asyncio.create_task(
                 _discovery_loop(client, equities, state, kalshi_ws, log,
                                  interval_seconds=args.discovery_interval_s))
-            # Phase 14.17 - timer-driven pretrigger sampler runs alongside the
-            # WS pump. The pump caches books; this loop fires envelopes on
-            # wall-clock observe windows (decoupled from WS event timing).
-            sample_task = asyncio.create_task(
-                _sample_loop(state, alpaca, log, client=client,
-                             interval_s=5.0, duration_s=args.duration_s))
             try:
                 await _run_loop(kalshi_ws, state, alpaca, log, args.duration_s)
             finally:
                 discovery_task.cancel()
-                sample_task.cancel()
-                try:
-                    await sample_task
-                except (asyncio.CancelledError, Exception):
-                    pass
                 try:
                     await discovery_task
                 except (asyncio.CancelledError, Exception):
@@ -663,42 +520,6 @@ async def _run_loop(kalshi_ws, state, alpaca, log, duration_s: float) -> None:
             await pump_task
         except (asyncio.CancelledError, Exception):
             pass
-
-
-async def _sample_loop(state: _InxuObserverState, alpaca: AlpacaSpotPoller,
-                        log: LiveLogWriter, client=None,
-                        interval_s: float = 5.0, duration_s: float = 0.0,
-                        heartbeat_every: int = 12) -> None:
-    """Phase 14.17 - timer-driven pretrigger sampler. Wakes every
-    ``interval_s`` and calls _sample_due_windows on wall-clock time, mirroring
-    the trader's decision_loop. Emits a periodic heartbeat (default ~60s) so a
-    live tail can confirm the observer is alive and waiting between windows."""
-    deadline = (time.time() + duration_s) if duration_s > 0 else None
-    ticks = 0
-    while True:
-        if deadline is not None and time.time() >= deadline:
-            return
-        now_ms = int(time.time() * 1000)
-        try:
-            await _sample_due_windows(state, alpaca, log, now_ms, client=client)
-        except asyncio.CancelledError:
-            return
-        except Exception as exc:
-            log.write({"kind": "sample_loop_error", "error": repr(exc)})
-        ticks += 1
-        if heartbeat_every and ticks % heartbeat_every == 0:
-            log.write({
-                "kind": "observer_heartbeat",
-                "registered": len(state.markets),
-                "cached_books": len(state.last_book),
-                "windows_fired": len(state.fired),
-                "rth_open": AlpacaSpotPoller.is_market_open(),
-                "ts_ms": now_ms,
-            })
-        try:
-            await asyncio.sleep(interval_s)
-        except asyncio.CancelledError:
-            return
 
 
 def main(argv=None) -> int:
