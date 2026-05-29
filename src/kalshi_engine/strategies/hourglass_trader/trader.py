@@ -56,6 +56,29 @@ class HourMarketMeta:
 # trader regardless of any model output.
 FAV_CHASE_TRIGGER_DECICENTS = 750.0
 
+# Phase 14.19 — BTC 1hr alpha capture (4-day cohort deep dive 2026-05-29,
+# _tmp_analysis/btc_1hr_deep_dive). THREE BTC-1hr-ONLY levers; ETH and every
+# other crypto are untouched. See ACTIONABLE.md / SYNTHESIS.md for the CIs.
+#
+# A (size-tilt UP, Rank 1 — the only CI-clean lever): when the v13b score is
+#   >= BTC_SIZE_TILT_SCORE OR the cycle is >= BTC_SIZE_TILT_MINUTE in, lift the
+#   size to BTC_SIZE_TILT_CONTRACTS. Cohort n=34, WR 100%, per-ct +$0.049 CI
+#   [+0.035, +0.066]; it traded ~9ct, so 15ct captures +$12-23/wk.
+BTC_SIZE_TILT_SCORE = 6.0
+BTC_SIZE_TILT_MINUTE = 40.0
+BTC_SIZE_TILT_CONTRACTS = 15
+# B (size DOWN, Rank 2 — variance reducer): when d_norm < BTC_DOWNSIZE_DNORM,
+#   clamp to BTC_DOWNSIZE_CONTRACTS regardless of what the tier ladder / tilt
+#   produced. The d_norm<1.5 tail held the entire -$21.35 current-config drag
+#   (per-ct -$0.127, CI straddles 0): still collects the high-WR win but stops
+#   betting big on weak strike separation.
+BTC_DOWNSIZE_DNORM = 1.5
+BTC_DOWNSIZE_CONTRACTS = 2
+# C (lower fav-cost cap, Rank 3 — directional): a BTC-only cap on the favorite
+#   ASK, tighter than the global --max-favorite-cost-decicents mid cap. Refuses
+#   the 0.88-0.92 fee-trap entries (fav_mid 910-920 cohort -$4.50).
+BTC_MAX_FAV_ASK_DECICENTS = 880
+
 
 class HourglassTraderStrategy:
     """1hr live trader. Returns Decision on book events that land in a
@@ -211,12 +234,14 @@ class HourglassTraderStrategy:
             fav_side, fav_mid = Side.YES, yes_mid
         else:
             fav_side, fav_mid = Side.NO, no_mid
+        fav_ask = book.yes_ask if fav_side is Side.YES else book.no_ask
 
         ts_utc = datetime.fromtimestamp(book.recv_ms / 1000, tz=timezone.utc)
         diag_base = {
             "ticker": book.ticker,
             "side": fav_side.value,
             "favorite_mid_decicents": fav_mid,
+            "favorite_ask_decicents": fav_ask,
             "strike": meta.strike,
             "elapsed_min": elapsed_min,
             "tau_min": (meta.close_ms - book.recv_ms) / 60_000.0,
@@ -263,6 +288,15 @@ class HourglassTraderStrategy:
                 book.ticker, fav_side,
                 f"could not determine crypto for ticker {book.ticker}",
                 diag_base,
+            )
+        # Phase 14.19 Change C — BTC-only tighter favorite-cost cap on the ASK.
+        if crypto.upper() == "BTC" and fav_ask > BTC_MAX_FAV_ASK_DECICENTS:
+            return self._skip_decision(
+                book.ticker, fav_side,
+                f"BTC fav_ask {fav_ask:.0f}dc > Phase14.19 cap "
+                f"{BTC_MAX_FAV_ASK_DECICENTS}dc (fee-trap zone)",
+                {**diag_base,
+                 "btc_max_fav_ask_decicents": BTC_MAX_FAV_ASK_DECICENTS},
             )
         cycle_key = (crypto.upper(), meta.open_ms)
         if cycle_key in self._entered_cycles:
@@ -316,6 +350,13 @@ class HourglassTraderStrategy:
                     {**diag_base, **(decision.diagnostics or {})},
                 )
 
+        # Phase 14.19 Changes A+B — BTC-only size-tilt-up / downsize levers.
+        # Applied BEFORE the per-crypto + global ceilings so those ceilings
+        # (raised to BTC_SIZE_TILT_CONTRACTS in the BTC config) stay consistent
+        # no-ops for the tilt cohort rather than silently clipping it back.
+        if decision.action == Action.ENTER and crypto.upper() == "BTC":
+            decision = self._apply_btc_size_levers(decision, elapsed_min)
+
         # Per-crypto cap (Phase 13.6) applied BEFORE the global ceiling.
         if decision.action == Action.ENTER:
             per_cap = self.per_crypto_max_contracts.get(crypto.upper())
@@ -353,6 +394,70 @@ class HourglassTraderStrategy:
         )
         self._log_decision(d)
         return d
+
+    # -- Phase 14.19 BTC-1hr sizing levers ------------------------------------
+    @staticmethod
+    def _safe_float(value) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _v13b_score(diag: dict | None) -> float | None:
+        """Pull the active align-mode's V13b score out of model diagnostics.
+
+        Each align mode stamps exactly one ``score_*`` key (BTC's production
+        d_norm-gate mode uses ``score_5tier_v13b_btc_dnorm_gate``); return the
+        first numeric one so this stays robust if the BTC mode is reshaped.
+        """
+        if not diag:
+            return None
+        for key, val in diag.items():
+            if key.startswith("score_") and isinstance(val, (int, float)):
+                return float(val)
+        return None
+
+    def _apply_btc_size_levers(
+        self, decision: Decision, elapsed_min: float,
+    ) -> Decision:
+        """Phase 14.19 BTC-1hr-only sizing levers (2026-05-29 deep dive).
+
+        A (size-tilt UP): on the only CI-clean cohort — v13b score >=
+          BTC_SIZE_TILT_SCORE OR elapsed >= BTC_SIZE_TILT_MINUTE — lift to
+          BTC_SIZE_TILT_CONTRACTS.
+        B (size DOWN): on the low-conviction tail — d_norm < BTC_DOWNSIZE_DNORM
+          — clamp to BTC_DOWNSIZE_CONTRACTS. Applied AFTER A so weak strike
+          separation always wins, regardless of tier ladder or tilt.
+        """
+        diag = decision.diagnostics or {}
+        score = self._v13b_score(diag)
+        d_norm = self._safe_float(diag.get("d_norm"))
+        size = decision.size
+
+        if (score is not None and score >= BTC_SIZE_TILT_SCORE) \
+                or elapsed_min >= BTC_SIZE_TILT_MINUTE:
+            size = BTC_SIZE_TILT_CONTRACTS
+
+        if (d_norm is not None and d_norm < BTC_DOWNSIZE_DNORM
+                and size > BTC_DOWNSIZE_CONTRACTS):
+            size = BTC_DOWNSIZE_CONTRACTS
+
+        if size == decision.size:
+            return decision
+        note = (f"P14.19 BTC size {decision.size}->{size} "
+                f"(score={score} elapsed_min={elapsed_min:.1f} d_norm={d_norm})")
+        new_diag = {
+            **diag,
+            "phase_14_19_size_before": decision.size,
+            "phase_14_19_size_after": size,
+        }
+        return replace(
+            decision, size=size,
+            reason=f"{decision.reason} | {note}", diagnostics=new_diag,
+        )
 
     def _log_decision(self, decision: Decision) -> None:
         self._log.write({

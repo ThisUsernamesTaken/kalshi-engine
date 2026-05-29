@@ -48,6 +48,14 @@ from kalshi_engine.strategies.hourglass_ladder.ladder import (
     LadderStrategy,
 )
 from kalshi_engine.strategies.hourglass_trader import HourglassTraderStrategy
+from kalshi_engine.strategies.hourglass_trader.trader import (
+    BTC_DOWNSIZE_CONTRACTS,
+    BTC_DOWNSIZE_DNORM,
+    BTC_MAX_FAV_ASK_DECICENTS,
+    BTC_SIZE_TILT_CONTRACTS,
+    BTC_SIZE_TILT_MINUTE,
+    BTC_SIZE_TILT_SCORE,
+)
 from kalshi_engine.warehouse.adapters import LiveLogWriter
 from kalshi_engine.warehouse.settlement import _iso_to_ms
 
@@ -937,6 +945,13 @@ async def _amain(args: argparse.Namespace) -> int:
             "deep_itm_skip_trigger_minutes": sorted(deep_itm.skip_trigger_minutes),
             "deep_itm_crypto_allowlist": list(deep_itm.crypto_allowlist),
             "deep_itm_daily_cap_cents": deep_itm.daily_cap_cents,
+            # Phase 14.19 BTC-1hr alpha-capture levers (BTC only)
+            "phase_14_19_btc_size_tilt_score": BTC_SIZE_TILT_SCORE,
+            "phase_14_19_btc_size_tilt_minute": BTC_SIZE_TILT_MINUTE,
+            "phase_14_19_btc_size_tilt_contracts": BTC_SIZE_TILT_CONTRACTS,
+            "phase_14_19_btc_downsize_dnorm": BTC_DOWNSIZE_DNORM,
+            "phase_14_19_btc_downsize_contracts": BTC_DOWNSIZE_CONTRACTS,
+            "phase_14_19_btc_max_fav_ask_decicents": BTC_MAX_FAV_ASK_DECICENTS,
         })
 
         _diag("constructing kalshi_ws + entering run_loop")

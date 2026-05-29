@@ -28,6 +28,13 @@ from kalshi_engine.strategies.favorite_chase.models.phase4_cutpoints import (
     Phase4CutpointsModel,
 )
 from kalshi_engine.strategies.hourglass_trader import HourglassTraderStrategy
+from kalshi_engine.strategies.hourglass_trader.trader import (
+    BTC_DOWNSIZE_CONTRACTS,
+    BTC_MAX_FAV_ASK_DECICENTS,
+    BTC_SIZE_TILT_CONTRACTS,
+)
+
+_BTC_SCORE_KEY = "score_5tier_v13b_btc_dnorm_gate"
 
 
 # ---- shared scaffolding ---------------------------------------------------
@@ -475,3 +482,166 @@ def test_custom_trigger_minutes_respected():
     assert s.on_event(book_30) is None
     assert s.on_event(book_45) is not None
     assert s.on_event(book_50) is None
+
+
+# ---- Phase 14.19 BTC-1hr alpha-capture levers ---------------------------
+
+def _btc_enter(size: int, score=None, d_norm=None) -> Decision:
+    diag: dict = {}
+    if score is not None:
+        diag[_BTC_SCORE_KEY] = score
+    if d_norm is not None:
+        diag["d_norm"] = d_norm
+    return Decision(
+        ticker="KXBTCD-T", action=Action.ENTER, side=Side.NO, size=size,
+        confidence=0.9, reason="model", diagnostics=diag,
+    )
+
+
+# Change A — size-tilt UP on score>=6 OR T+40.
+
+def test_p1419_tilt_up_on_high_score_at_t0():
+    """score=6.5 at T+0 -> size lifted to 15 (score path)."""
+    s, _ = _make_strategy()
+    out = s._apply_btc_size_levers(_btc_enter(9, score=6.5, d_norm=2.5),
+                                   elapsed_min=0.0)
+    assert out.size == BTC_SIZE_TILT_CONTRACTS == 15
+
+
+def test_p1419_tilt_up_on_late_minute_low_score():
+    """score=4 at T+45 -> size lifted to 15 (T+40 elapsed path)."""
+    s, _ = _make_strategy()
+    out = s._apply_btc_size_levers(_btc_enter(7, score=4.0, d_norm=2.5),
+                                   elapsed_min=45.0)
+    assert out.size == BTC_SIZE_TILT_CONTRACTS
+
+
+def test_p1419_no_tilt_low_score_early_minute():
+    """score=4 at T+30 -> size unchanged (neither tilt condition met)."""
+    s, _ = _make_strategy()
+    out = s._apply_btc_size_levers(_btc_enter(7, score=4.0, d_norm=2.5),
+                                   elapsed_min=30.0)
+    assert out.size == 7
+
+
+# Change B — downsize the weak-separation tail (d_norm < 1.5).
+
+def test_p1419_downsize_on_low_dnorm():
+    """d_norm=1.0 -> clamp to 1-2ct even if the tier ladder says 9."""
+    s, _ = _make_strategy()
+    out = s._apply_btc_size_levers(_btc_enter(9, score=5.0, d_norm=1.0),
+                                   elapsed_min=30.0)
+    assert out.size == BTC_DOWNSIZE_CONTRACTS == 2
+    assert out.size < 9
+
+
+def test_p1419_no_downsize_on_healthy_dnorm():
+    """d_norm=2.0 -> size unchanged."""
+    s, _ = _make_strategy()
+    out = s._apply_btc_size_levers(_btc_enter(9, score=5.0, d_norm=2.0),
+                                   elapsed_min=30.0)
+    assert out.size == 9
+
+
+def test_p1419_downsize_wins_over_tilt():
+    """Both fire (T+45 tilt + d_norm<1.5): downsize is the final word."""
+    s, _ = _make_strategy()
+    out = s._apply_btc_size_levers(_btc_enter(10, score=6.5, d_norm=1.0),
+                                   elapsed_min=45.0)
+    assert out.size == BTC_DOWNSIZE_CONTRACTS
+
+
+# Change C — BTC-only favorite-ASK cost cap (880dc).
+
+def test_p1419_fav_ask_cap_blocks_btc():
+    """BTC fav_ask=890dc > 880 -> SKIP (mid still under the 920 global cap)."""
+    s, _ = _make_strategy()
+    open_ms = 1_700_000_000_000
+    s.register_market("KXBTCD-T", strike=100_000.0,
+                      open_ms=open_ms, close_ms=open_ms + 3_600_000)
+    book = _make_book(
+        ticker="KXBTCD-T", cycle_open_ms=open_ms, elapsed_min=30.0,
+        # NO favorite: no_mid=875 (<920 global), fav_ask=no_ask=890 (>880).
+        yes_bid=110, yes_ask=140, no_bid=860, no_ask=890,
+    )
+    d = s.on_event(book)
+    assert d is not None
+    assert d.action is Action.SKIP
+    assert "Phase14.19 cap" in d.reason
+    assert d.diagnostics["btc_max_fav_ask_decicents"] == BTC_MAX_FAV_ASK_DECICENTS
+
+
+def test_p1419_fav_ask_cap_allows_btc_under_threshold():
+    """BTC fav_ask=875dc <= 880 -> not blocked by Change C."""
+    s, _ = _make_strategy()
+    open_ms = 1_700_000_000_000
+    s.register_market("KXBTCD-T", strike=100_000.0,
+                      open_ms=open_ms, close_ms=open_ms + 3_600_000)
+    book = _make_book(
+        ticker="KXBTCD-T", cycle_open_ms=open_ms, elapsed_min=30.0,
+        yes_bid=110, yes_ask=140, no_bid=845, no_ask=875,
+    )
+    d = s.on_event(book)
+    assert d is not None
+    assert "Phase14.19 cap" not in d.reason
+
+
+def test_p1419_fav_ask_cap_is_btc_only():
+    """ETH fav_ask=890dc is NOT blocked by the BTC-only Change C cap."""
+    s, _ = _make_strategy()
+    open_ms = 1_700_000_000_000
+    s.register_market("KXETHD-T", strike=3_000.0,
+                      open_ms=open_ms, close_ms=open_ms + 3_600_000)
+    book = _make_book(
+        ticker="KXETHD-T", cycle_open_ms=open_ms, elapsed_min=30.0,
+        yes_bid=110, yes_ask=140, no_bid=860, no_ask=890,
+    )
+    d = s.on_event(book)
+    assert d is not None
+    assert "Phase14.19 cap" not in d.reason
+
+
+# Integration through on_event (real sizing path, caps raised to 15).
+
+def test_p1419_tilt_through_on_event_reaches_15ct():
+    """A forced ENTER at T+40 size-tilts to 15 end-to-end (cap=15)."""
+    s, _ = _make_strategy(trigger_minutes=(40,), max_contracts=15)
+    open_ms = 1_700_000_000_000
+    s.register_market("KXBTCD-T", strike=100_000.0,
+                      open_ms=open_ms, close_ms=open_ms + 3_600_000)
+    s._model = MagicMock()
+    s._model.evaluate = MagicMock(return_value=Decision(
+        ticker="KXBTCD-T", action=Action.ENTER, side=Side.NO, size=9,
+        confidence=0.9, reason="forced ENTER",
+        diagnostics={_BTC_SCORE_KEY: 4.0, "d_norm": 2.5},
+    ))
+    book = _make_book(
+        ticker="KXBTCD-T", cycle_open_ms=open_ms, elapsed_min=40.0,
+        yes_bid=180, yes_ask=200, no_bid=800, no_ask=820,
+    )
+    d = s.on_event(book)
+    assert d is not None
+    assert d.action is Action.ENTER
+    assert d.size == 15
+
+
+def test_p1419_downsize_through_on_event():
+    """A forced ENTER at T+40 with d_norm<1.5 ends at 2ct (downsize wins)."""
+    s, _ = _make_strategy(trigger_minutes=(40,), max_contracts=15)
+    open_ms = 1_700_000_000_000
+    s.register_market("KXBTCD-T", strike=100_000.0,
+                      open_ms=open_ms, close_ms=open_ms + 3_600_000)
+    s._model = MagicMock()
+    s._model.evaluate = MagicMock(return_value=Decision(
+        ticker="KXBTCD-T", action=Action.ENTER, side=Side.NO, size=9,
+        confidence=0.9, reason="forced ENTER",
+        diagnostics={_BTC_SCORE_KEY: 5.0, "d_norm": 1.0},
+    ))
+    book = _make_book(
+        ticker="KXBTCD-T", cycle_open_ms=open_ms, elapsed_min=40.0,
+        yes_bid=180, yes_ask=200, no_bid=800, no_ask=820,
+    )
+    d = s.on_event(book)
+    assert d is not None
+    assert d.action is Action.ENTER
+    assert d.size == BTC_DOWNSIZE_CONTRACTS

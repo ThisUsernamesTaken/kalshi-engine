@@ -118,8 +118,8 @@ $Services = @(
     }
     @{
         Name = "KalshiEngine1hr"
-        DisplayName = "Kalshi Engine - 1hr (Phase 14.9 BTC d_norm + 14.12 ladder)"
-        Description = "Live 1hr engine (real money). BTC d_norm close-strike gate, ETH 1to3 ramp, T+15/30/40/55 triggers. Daily cap `$10. Phase 14.12 BTC ladder companion at T+30 (3 rungs, d_norm>=1.5, 3ct each, `$5/day cap)."
+        DisplayName = "Kalshi Engine - 1hr (Phase 14.9 BTC d_norm + 14.12 ladder + 14.19 BTC alpha)"
+        Description = "Live 1hr engine (real money). BTC d_norm close-strike gate, ETH 1to3 ramp, T+15/30/40/55 triggers. Daily cap `$10. Phase 14.12 BTC ladder companion at T+30 (3 rungs, d_norm>=1.5, 3ct each, `$5/day cap). Phase 14.19 BTC-only alpha-capture levers: size-tilt up to 15ct on score>=6|T+40, downsize to 2ct on d_norm<1.5, BTC fav-ask cap 880dc. BTC contract caps raised 10->15 to fit the tilt."
         Module = "kalshi_engine.bin.live_1hr"
         Args = @(
             "--strategy", "favorite_chase",
@@ -128,8 +128,13 @@ $Services = @(
             "--cutpoints-version", "v1",
             "--align-mode", "5tier_v13b_7_10_10",
             "--per-crypto-align-mode", "BTC=5tier_v13b_btc_dnorm_gate,ETH=5tier_v13b_1to3_ramp",
-            "--per-crypto-max-contracts", "BTC=10,ETH=3",
-            "--max-contracts", "10",
+            # Phase 14.19: BTC raised 10->15 so the score>=6|T+40 size-tilt
+            # (15ct) is not clipped by the per-crypto cap. ETH unchanged at 3.
+            "--per-crypto-max-contracts", "BTC=15,ETH=3",
+            # Phase 14.19: global ceiling 10->15 so the BTC tilt also clears
+            # the RiskEnvelope max_contracts_per_trade clip. ETH stays bounded
+            # by its per-crypto cap (3); BTC non-tilt trades stay <=10 (model).
+            "--max-contracts", "15",
             "--max-favorite-cost-decicents", "920",
             "--daily-cap-cents", "1000",
             "--trigger-minutes", "15,30,40,55",
